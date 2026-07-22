@@ -1,0 +1,138 @@
+﻿# ============================================================
+# Build outputs
+# ============================================================
+
+/build/
+/out/
+/dist/
+
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+Makefile
+
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+
+# ============================================================
+# Native compiler outputs
+# ============================================================
+
+*.obj
+*.o
+*.lo
+
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.ipdb
+*.iobj
+
+*.a
+*.so
+*.dylib
+
+# Import libraries are generally generated binaries.
+# The compatibility import library is intentionally versioned.
+*.lib
+!/compatibility/obs-32.1.2/obs.lib
+
+# ============================================================
+# External dependencies and local OBS runtime
+# ============================================================
+
+/deps/
+/runtime/
+/win-capture/
+
+# ============================================================
+# Generated capture/debug output
+# ============================================================
+
+/captures/
+/recordings/
+/screenshots/
+/frames/
+/debug-output/
+/logs/
+
+*.log
+*.dmp
+*.trace
+
+# ============================================================
+# Temporary and backup files
+# ============================================================
+
+*.tmp
+*.temp
+*.bak
+*.old
+*.orig
+*.rej
+*.swp
+*.swo
+*~
+
+*.before-*
+*.backup
+*.backup.*
+
+/src-before-*/
+/pre-generic-*/
+/rename-backup-*/
+
+# ============================================================
+# Editor and IDE files
+# ============================================================
+
+.vs/
+.vscode/
+.idea/
+
+*.code-workspace
+
+# ============================================================
+# Operating-system files
+# ============================================================
+
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ============================================================
+# Local environment and secrets
+# ============================================================
+
+.env
+.env.*
+!.env.example
+
+*.pem
+*.key
+*.pfx
+*.p12
+*.keystore
+
+# ============================================================
+# Local package/download archives
+# ============================================================
+
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+
+# ============================================================
+# Local repository-maintenance backups
+# ============================================================
+
+.gitignore.backup
