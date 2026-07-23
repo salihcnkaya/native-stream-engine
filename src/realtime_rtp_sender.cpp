@@ -835,10 +835,6 @@ void RealtimeRtpSender::senderLoop()
 {
     DWORD priority = THREAD_PRIORITY_ABOVE_NORMAL;
 
-    if (label_ == "video") {
-        priority = THREAD_PRIORITY_HIGHEST;
-    }
-
     if (!SetThreadPriority(GetCurrentThread(), priority)) {
         std::cerr << "[Realtime RTP Sender:" << label_
                   << "] failed to set thread priority, error="
