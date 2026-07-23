@@ -1151,24 +1151,35 @@ int runNativeService()
 								<< captureFrameHeight
 								<< "\n";
 
+						const bool audioStreamingEnabled =
+										audioRtpEnabled &&
+										audio != "none";
+
 						bool audioOk = true;
 
-						if (audio == "none") {
-								audioOk = true;
+						if (!audioStreamingEnabled) {
+										std::cerr
+														<< "[Native Stream Service] "
+														<< "audio capture disabled\n";
 						} else if (audio == "desktop") {
-								audioOk = g_engine->createDesktopAudioSource();
+										audioOk =
+														g_engine->createDesktopAudioSource();
 						} else if (audio == "process") {
-								audioOk = g_engine->createProcessAudioSource(hwnd);
+										audioOk =
+														g_engine->createProcessAudioSource(hwnd);
 						} else {
-								if (captureType == CaptureType::Monitor) {
-										audioOk = g_engine->createDesktopAudioSource();
-								} else {
-										audioOk = g_engine->createProcessAudioSource(hwnd);
+										if (captureType == CaptureType::Monitor) {
+														audioOk =
+																		g_engine->createDesktopAudioSource();
+										} else {
+														audioOk =
+																		g_engine->createProcessAudioSource(hwnd);
 
-										if (!audioOk) {
-												audioOk = g_engine->createDesktopAudioSource();
+														if (!audioOk) {
+																		audioOk =
+																						g_engine->createDesktopAudioSource();
+														}
 										}
-								}
 						}
 
 						if (!audioOk) {
@@ -1202,10 +1213,10 @@ int runNativeService()
 												ssrc,
 												bitrate,
 												encoder,
-												audioRtpIp,
-												audioRtpPort,
+												audioStreamingEnabled ? audioRtpIp : std::string{},
+												audioStreamingEnabled ? audioRtpPort : 0,
 												audioPayloadType,
-												audioSsrc
+												audioStreamingEnabled ? audioSsrc : 0
 								)) {
 										cleanup_active_capture_state();
 										send_json(

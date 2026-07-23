@@ -1372,6 +1372,11 @@ bool ObsEngine::startRtpStreaming(
         return false;
     }
 
+    const bool audioRtpEnabled =
+        !audioRtpIp.empty() &&
+        audioRtpPort > 0 &&
+        audioSsrc > 0;
+
     const auto encoderCandidates =
         buildVideoEncoderCandidates(encoder);
 
@@ -1446,11 +1451,7 @@ bool ObsEngine::startRtpStreaming(
         return false;
     }
 
-    if (
-        !audioRtpIp.empty() &&
-        audioRtpPort > 0 &&
-        audioSsrc > 0
-    ) {
+    if (audioRtpEnabled) {
         g_realtimeRtpAudioSender.setLabel("audio");
 
         if (
@@ -1562,58 +1563,57 @@ bool ObsEngine::startRtpStreaming(
             continue;
         }
 
-        obs_data_t* audioSettings =
-            obs_data_create();
+        if (audioRtpEnabled) {
+            obs_data_t* audioSettings =
+                obs_data_create();
 
-        obs_data_set_int(
-            audioSettings,
-            "bitrate",
-            160
-        );
-
-        g_rtpAudioEncoder =
-            obs_audio_encoder_create(
-                "ffmpeg_opus",
-                "RTP Opus Encoder",
+            obs_data_set_int(
                 audioSettings,
-                0,
-                nullptr
+                "bitrate",
+                160
             );
 
-        obs_data_release(audioSettings);
+            g_rtpAudioEncoder =
+                obs_audio_encoder_create(
+                    "ffmpeg_opus",
+                    "RTP Opus Encoder",
+                    audioSettings,
+                    0,
+                    nullptr
+                );
 
-        if (!g_rtpAudioEncoder) {
-            std::cerr
-                << "[Realtime RTP] audio encoder creation failed"
-                << " encoderId=" << candidate.id
-                << " family=" << candidate.family
-                << "\n";
+            obs_data_release(audioSettings);
 
-            releaseRtpStreamingResources();
+            if (!g_rtpAudioEncoder) {
+                std::cerr
+                    << "[Realtime RTP] "
+                    << "audio encoder creation failed"
+                    << " encoderId=" << candidate.id
+                    << " family=" << candidate.family
+                    << "\n";
 
-            /*
-            * Opus encoder hatasÄ± aslÄ±nda video encoder'a baÄŸlÄ±
-            * deÄŸildir. Ancak attempt bÃ¼tÃ¼nlÃ¼ÄŸÃ¼nÃ¼ korumak iÃ§in mevcut
-            * aday temizlenir. SonrasÄ±nda diÄŸer aday denenebilir.
-            */
-            continue;
+                releaseRtpStreamingResources();
+                continue;
+            }
+
+            obs_encoder_set_audio(
+                g_rtpAudioEncoder,
+                obs_get_audio()
+            );
         }
-
-        obs_encoder_set_audio(
-            g_rtpAudioEncoder,
-            obs_get_audio()
-        );
 
         obs_output_set_video_encoder(
             g_rtpOutput,
             g_rtpVideoEncoder
         );
 
-        obs_output_set_audio_encoder(
-            g_rtpOutput,
-            g_rtpAudioEncoder,
-            0
-        );
+        if (audioRtpEnabled) {
+            obs_output_set_audio_encoder(
+                g_rtpOutput,
+                g_rtpAudioEncoder,
+                0
+            );
+        }
 
         obs_output_add_packet_callback(
             g_rtpOutput,
