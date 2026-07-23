@@ -52,7 +52,7 @@ public:
     bool retransmitPacket(uint16_t rtpSequenceNumber);
 
 private:
-    static constexpr size_t MAX_RTP_PACKET_SIZE = 1500;
+    static constexpr size_t MAX_RTP_PACKET_SIZE = 1200;
     static constexpr size_t RTP_HEADER_SIZE = 12;
     static constexpr size_t RING_SIZE = 2048;
     static constexpr size_t RTP_EXTENSION_HEADER_SIZE = 4;
