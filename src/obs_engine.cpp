@@ -388,12 +388,17 @@ static void sendAnnexBNalsAsRtp(
     uint32_t timestamp
 )
 {
+    if (!data || size == 0) {
+        return;
+    }
+
     struct NalView {
         const uint8_t* data = nullptr;
         size_t size = 0;
     };
 
     std::vector<NalView> nals;
+    nals.reserve(16);
 
     size_t start = findStartCode(data, size, 0);
 
