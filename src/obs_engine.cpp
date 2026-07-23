@@ -40,8 +40,17 @@ static int64_t g_firstAudioPts = 0;
 static bool g_firstAudioPtsSet = false;
 static RealtimeRtpSender g_realtimeRtpSender;
 static RealtimeRtpSender g_realtimeRtpAudioSender;
+
+#if defined(NDEBUG)
+static constexpr bool STREAM_DEBUG_BITRATE_DECISIONS = false;
+static constexpr bool STREAM_DEBUG_KEYFRAME_REQUESTS = false;
+static constexpr bool STREAM_FORWARD_OBS_DEBUG_LOGS = false;
+#else
 static constexpr bool STREAM_DEBUG_BITRATE_DECISIONS = true;
 static constexpr bool STREAM_DEBUG_KEYFRAME_REQUESTS = true;
+static constexpr bool STREAM_FORWARD_OBS_DEBUG_LOGS = true;
+#endif
+
 static uint32_t g_lastPliCount = 0;
 static uint32_t g_lastFirCount = 0;
 static uint32_t g_lastNackPacketCount = 0;
@@ -57,6 +66,13 @@ static void nativeObsLogHandler(
 )
 {
     if (!format) {
+        return;
+    }
+
+    if (
+        logLevel == LOG_DEBUG &&
+        !STREAM_FORWARD_OBS_DEBUG_LOGS
+    ) {
         return;
     }
 
