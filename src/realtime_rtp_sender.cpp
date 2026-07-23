@@ -144,6 +144,28 @@ bool RealtimeRtpSender::start(
 
     u_long nonBlocking = 1;
     ioctlsocket(socket_, FIONBIO, &nonBlocking);
+
+    packetAvailableEvent_ = CreateEventW(
+        nullptr,
+        FALSE,
+        FALSE,
+        nullptr
+    );
+
+    if (!packetAvailableEvent_) {
+        std::cerr
+            << "[Realtime RTP Sender:"
+            << label_
+            << "] CreateEventW failed, error="
+            << GetLastError()
+            << "\n";
+
+        closesocket(socket_);
+        socket_ = INVALID_SOCKET;
+        WSACleanup();
+
+        return false;
+    }
     
     running_ = true;
     senderThreadRunning_ = true;
@@ -168,8 +190,17 @@ void RealtimeRtpSender::stop()
 
     senderThreadRunning_ = false;
 
+    if (packetAvailableEvent_) {
+        SetEvent(packetAvailableEvent_);
+    }
+
     if (senderThread_.joinable()) {
         senderThread_.join();
+    }
+
+    if (packetAvailableEvent_) {
+        CloseHandle(packetAvailableEvent_);
+        packetAvailableEvent_ = nullptr;
     }
 
     if (socket_ != INVALID_SOCKET) {
@@ -569,6 +600,10 @@ bool RealtimeRtpSender::enqueueRtpPacket(
     ) {
     }
 
+    if (packetAvailableEvent_) {
+        SetEvent(packetAvailableEvent_);
+    }
+
     return true;
 }
 
@@ -868,7 +903,18 @@ void RealtimeRtpSender::senderLoop()
 
         if (readSeq == writeSeq) {
             nextSendTime = clock::now();
-            std::this_thread::sleep_for(std::chrono::microseconds(200));
+
+            if (packetAvailableEvent_) {
+                WaitForSingleObject(
+                    packetAvailableEvent_,
+                    2
+                );
+            } else {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(2)
+                );
+            }
+
             continue;
         }
 

@@ -126,6 +126,7 @@ private:
     std::array<RtpPacket, RING_SIZE> ring_ {};
 
     std::thread senderThread_;
+    HANDLE packetAvailableEvent_ = nullptr;
 
     std::atomic<uint64_t> packetsQueued_{ 0 };
     std::atomic<uint64_t> packetsSent_{ 0 };
