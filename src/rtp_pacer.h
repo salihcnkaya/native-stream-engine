@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <atomic>
 #include <string>
+#include <mutex>
 #include "network_feedback.h"
 #include "bitrate_controller.h"
 
@@ -60,8 +61,13 @@ public:
 
 private:
     RtpPacerConfig config_{};
+
+    mutable std::mutex stateMutex_;
+    
     NetworkFeedback feedback_{};
-    mutable bool adaptiveVideoActive_ { false };
     BitrateController bitrateController_;
     BitrateDecision lastBitrateDecision_{};
+    
+    std::atomic<bool> adaptiveVideoActive_{ false };
+    std::atomic<uint32_t> adaptiveVideoExtraUs_{ 0 };
 };

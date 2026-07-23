@@ -3,50 +3,94 @@
 
 void RtpPacer::setInitialBitrate(uint32_t bitrateBps)
 {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+
     bitrateController_.setInitialBitrate(bitrateBps);
     lastBitrateDecision_.targetBitrateBps = bitrateBps;
     lastBitrateDecision_.shouldChangeEncoder = false;
 }
 
-void RtpPacer::updateNetworkFeedback(const NetworkFeedback& feedback)
+void RtpPacer::updateNetworkFeedback(
+    const NetworkFeedback& feedback
+)
 {
-    feedback_ = feedback;
-    lastBitrateDecision_ = bitrateController_.update(feedback_);
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+
+        feedback_ = feedback;
+
+        lastBitrateDecision_ =
+            bitrateController_.update(feedback_);
+    }
+
+    bool adaptiveActive =
+        adaptiveVideoActive_.load(
+            std::memory_order_relaxed
+        );
+
+    if (!feedback.hasFeedback) {
+        adaptiveActive = false;
+    } else {
+        const bool forceOn =
+            feedback.packetLossRatio >= 0.01 ||
+            feedback.jitterMs >= 120 ||
+            feedback.score < 8;
+
+        const bool keepOn =
+            feedback.jitterMs >= 90 &&
+            feedback.score >= 8;
+
+        if (forceOn) {
+            adaptiveActive = true;
+        } else if (!keepOn) {
+            adaptiveActive = false;
+        }
+    }
+
+    uint32_t adaptiveExtraUs = 0;
+
+    if (adaptiveActive) {
+        if (
+            feedback.packetLossRatio >= 0.01 ||
+            feedback.jitterMs >= 250 ||
+            feedback.score < 8
+        ) {
+            adaptiveExtraUs = 20;
+        } else if (feedback.jitterMs >= 120) {
+            adaptiveExtraUs = 10;
+        }
+    }
+
+    adaptiveVideoActive_.store(
+        adaptiveActive,
+        std::memory_order_release
+    );
+
+    adaptiveVideoExtraUs_.store(
+        adaptiveExtraUs,
+        std::memory_order_release
+    );
 }
 
 NetworkFeedback RtpPacer::networkFeedback() const
 {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+
     return feedback_;
 }
 
 BitrateDecision RtpPacer::bitrateDecision() const
 {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+
     return lastBitrateDecision_;
 }
 
 bool RtpPacer::shouldUseAdaptiveVideo() const
 {
-    if (!feedback_.hasFeedback) {
-        adaptiveVideoActive_ = false;
-        return false;
-    }
-
-    const bool forceOn =
-        feedback_.packetLossRatio >= 0.01 ||
-        feedback_.jitterMs >= 120 ||
-        feedback_.score < 8;
-
-    const bool keepOn =
-        feedback_.jitterMs >= 90 &&
-        feedback_.score >= 8;
-
-    if (forceOn) {
-        adaptiveVideoActive_ = true;
-    } else if (!keepOn) {
-        adaptiveVideoActive_ = false;
-    }
-
-    return adaptiveVideoActive_;
+    return adaptiveVideoActive_.load(
+        std::memory_order_acquire
+    );
 }
 
 bool RtpPacer::isAdaptiveActive() const
@@ -54,28 +98,18 @@ bool RtpPacer::isAdaptiveActive() const
     return shouldUseAdaptiveVideo();
 }
 
-uint32_t RtpPacer::adaptiveExtraUs(bool isVideo) const
+uint32_t RtpPacer::adaptiveExtraUs(
+    bool isVideo
+) const
 {
-    if (!isVideo || !shouldUseAdaptiveVideo()) {
+    if (!isVideo) {
         return 0;
     }
 
-    if (
-        feedback_.packetLossRatio >= 0.01 ||
-        feedback_.jitterMs >= 250 ||
-        feedback_.score < 8
-    ) {
-        return 20;
-    }
-
-    if (feedback_.jitterMs >= 120) {
-        return 10;
-    }
-
-    return 0;
+    return adaptiveVideoExtraUs_.load(
+        std::memory_order_acquire
+    );
 }
-
-
 
 std::chrono::microseconds RtpPacer::calculateSpacing(
     bool isVideo,
@@ -156,6 +190,8 @@ void RtpPacer::logBaseline(
     uint32_t maxBatch
 ) const
 {
+    const auto feedback = networkFeedback();
+
     std::cerr << "[Realtime RTP Sender:" << label
               << "] pacing baseline"
               << " maxBatch=" << maxBatch
@@ -167,13 +203,13 @@ void RtpPacer::logBaseline(
               << " audioQ60Us=" << calculateSpacing(false, 61).count()
               << " audioQ120Us=" << calculateSpacing(false, 121).count()
               << " audioQ300Us=" << calculateSpacing(false, 301).count()
-              << " feedback=" << (feedback_.hasFeedback ? "yes" : "no")
-              << " loss=" << feedback_.packetLossRatio
-              << " jitterMs=" << feedback_.jitterMs
-              << " rttMs=" << feedback_.rttMs
-              << " score=" << feedback_.score
-              << " bitrate=" << feedback_.bitrateBps
-              << " packetCount=" << feedback_.packetCount
-              << " byteCount=" << feedback_.byteCount
+              << " feedback=" << (feedback.hasFeedback ? "yes" : "no")
+              << " loss=" << feedback.packetLossRatio
+              << " jitterMs=" << feedback.jitterMs
+              << " rttMs=" << feedback.rttMs
+              << " score=" << feedback.score
+              << " bitrate=" << feedback.bitrateBps
+              << " packetCount=" << feedback.packetCount
+              << " byteCount=" << feedback.byteCount
               << "\n";
 } 
