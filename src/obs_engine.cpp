@@ -976,7 +976,6 @@ buildVideoEncoderCandidates(
         appendNvenc();
         appendQsv();
         appendAmf();
-        appendX264();
 
         return candidates;
     }
@@ -988,7 +987,6 @@ buildVideoEncoderCandidates(
         appendAmf();
         appendNvenc();
         appendQsv();
-        appendX264();
 
         return candidates;
     }
@@ -997,7 +995,6 @@ buildVideoEncoderCandidates(
         appendQsv();
         appendNvenc();
         appendAmf();
-        appendX264();
 
         return candidates;
     }
@@ -1008,15 +1005,9 @@ buildVideoEncoderCandidates(
         return candidates;
     }
 
-    /*
-     * AUTO:
-     * Ã–nce donanÄ±msal encoder'lar,
-     * en son yazÄ±lÄ±msal x264.
-     */
     appendNvenc();
     appendQsv();
     appendAmf();
-    appendX264();
 
     return candidates;
 }
