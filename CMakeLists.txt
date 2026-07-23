@@ -101,6 +101,16 @@ if(MSVC)
             /permissive-
             /external:anglebrackets
             /external:W0
+
+            $<$<CONFIG:Release>:/GL>
+    )
+
+    target_link_options(
+        native-stream-engine
+        PRIVATE
+            $<$<CONFIG:Release>:/LTCG>
+            $<$<CONFIG:Release>:/OPT:REF>
+            $<$<CONFIG:Release>:/OPT:ICF>
     )
 endif()
 
