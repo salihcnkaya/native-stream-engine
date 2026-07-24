@@ -1707,30 +1707,42 @@ bool ObsEngine::startRtpStreaming(
 
 void ObsEngine::stopRtpStreaming()
 {
+    if (!g_rtpStreaming) {
+        return;
+    }
 
-    if (!g_rtpStreaming) return;
-    
     g_rtpStreaming = false;
 
-    std::cerr << "[Realtime RTP] stop requested\n";
+    std::cerr
+        << "[Realtime RTP] stop requested\n";
 
-    stopActiveRtpSenders();
-
+    /*
+     * Önce OBS output'u durdur.
+     * Böylece encoder callback'i artık yeni RTP paketi
+     * üretmeye devam etmez.
+     */
     if (g_rtpOutput) {
-
         if (obs_output_active(g_rtpOutput)) {
             obs_output_stop(g_rtpOutput);
         }
+    }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    /*
+     * Output durduktan sonra sender queue'larını kapat.
+     * Böylece output stop sırasında üretilmiş son paketler
+     * sender tarafından işlenebilir.
+     */
+    stopActiveRtpSenders();
 
-    }    
-    
+    /*
+     * Output ve encoder referanslarını son olarak bırak.
+     */
     releaseRtpStreamingResources();
 
     g_lastPliCount = 0;
     g_lastFirCount = 0;
     g_lastNackPacketCount = 0;
+
     g_lastKeyframeRequestAt = std::chrono::steady_clock::time_point{};
 }
 
