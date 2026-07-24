@@ -147,6 +147,16 @@ private:
     std::atomic<uint64_t> historyPacketsRetransmitted_{ 0 };
     std::atomic<uint64_t> historyPacketsMissed_{ 0 };
 
+    std::atomic<uint64_t> senderLoopIterations_{ 0 };
+
+    std::atomic<uint64_t> emptyQueueWaits_{ 0 };
+    std::atomic<uint64_t> emptyQueueSignals_{ 0 };
+    std::atomic<uint64_t> emptyQueueTimeouts_{ 0 };
+    std::atomic<uint64_t> emptyQueueWaitErrors_{ 0 };
+
+    std::atomic<uint64_t> pacingCalls_{ 0 };
+    std::atomic<uint64_t> packetsProcessedByLoop_{ 0 };
+
     static constexpr size_t RTX_SUPPRESSION_SIZE = 256;
 
     std::array<uint16_t, RTX_SUPPRESSION_SIZE> lastRetransmitSeqs_ {};

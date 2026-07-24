@@ -34,22 +34,118 @@ BitrateDecision RealtimeRtpSender::bitrateDecision() const
 
 void RealtimeRtpSender::resetStats()
 {
-    packetsQueued_ = 0;
-    packetsSent_ = 0;
-    packetsDropped_ = 0;
-    bytesSent_ = 0;
-    maxQueueSeen_ = 0;
-    sendFailures_ = 0;
-    partialSends_ = 0;
-    totalQueueLatencyMs_ = 0;
-    maxQueueLatencyMs_ = 0;
-    queueLatencySamples_ = 0;
-    historyPacketsStored_ = 0;
-    historyPacketsRetransmitted_ = 0;
-    historyPacketsMissed_ = 0;
-    lastRetransmitWriteIndex_ = 0;
-    retransmitsThisSecond_ = 0;
-    retransmitWindowStartedAt_ = std::chrono::steady_clock::time_point{};
+    packetsQueued_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    packetsSent_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    packetsDropped_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    bytesSent_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    maxQueueSeen_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    sendFailures_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    partialSends_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    totalQueueLatencyMs_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    maxQueueLatencyMs_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    queueLatencySamples_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    historyPacketsStored_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    historyPacketsRetransmitted_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    historyPacketsMissed_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    lastRetransmitWriteIndex_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    retransmitsThisSecond_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    retransmitWindowStartedAt_ =
+        std::chrono::steady_clock::time_point{};
+
+    senderLoopIterations_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    emptyQueueWaits_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    emptyQueueSignals_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    emptyQueueTimeouts_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    emptyQueueWaitErrors_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    pacingCalls_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    packetsProcessedByLoop_.store(
+        0,
+        std::memory_order_relaxed
+    );
 
     for (auto& seq : lastRetransmitSeqs_) {
         seq = 0xffff;
@@ -242,7 +338,37 @@ void RealtimeRtpSender::stop()
         << " sendFailures="
         << sendFailures_.load(std::memory_order_relaxed)
         << " partialSends="
-        << partialSends_.load(std::memory_order_relaxed)
+        << partialSends_.load(
+            std::memory_order_relaxed
+        )
+        << " loopIterations="
+        << senderLoopIterations_.load(
+            std::memory_order_relaxed
+        )
+        << " packetsProcessed="
+        << packetsProcessedByLoop_.load(
+            std::memory_order_relaxed
+        )
+        << " pacingCalls="
+        << pacingCalls_.load(
+            std::memory_order_relaxed
+        )
+        << " emptyWaits="
+        << emptyQueueWaits_.load(
+            std::memory_order_relaxed
+        )
+        << " emptySignals="
+        << emptyQueueSignals_.load(
+            std::memory_order_relaxed
+        )
+        << " emptyTimeouts="
+        << emptyQueueTimeouts_.load(
+            std::memory_order_relaxed
+        )
+        << " emptyWaitErrors="
+        << emptyQueueWaitErrors_.load(
+            std::memory_order_relaxed
+        )
         << "\n";
 }
 
@@ -897,6 +1023,10 @@ void RealtimeRtpSender::senderLoop()
     pacer_.logBaseline(label_, MAX_BATCH_PACKETS);
 
     while (senderThreadRunning_) {
+        senderLoopIterations_.fetch_add(
+            1,
+            std::memory_order_relaxed
+        );
         drainIncomingControlPackets();
         const uint64_t readSeq = consumeSequence_.load(std::memory_order_relaxed);
         const uint64_t writeSeq = publishSequence_.load(std::memory_order_acquire);
@@ -904,14 +1034,42 @@ void RealtimeRtpSender::senderLoop()
         if (readSeq == writeSeq) {
             nextSendTime = clock::now();
 
+            emptyQueueWaits_.fetch_add(
+                1,
+                std::memory_order_relaxed
+            );
+
             if (packetAvailableEvent_) {
-                WaitForSingleObject(
-                    packetAvailableEvent_,
-                    2
-                );
+                const DWORD waitResult =
+                    WaitForSingleObject(
+                        packetAvailableEvent_,
+                        2
+                    );
+
+                if (waitResult == WAIT_OBJECT_0) {
+                    emptyQueueSignals_.fetch_add(
+                        1,
+                        std::memory_order_relaxed
+                    );
+                } else if (waitResult == WAIT_TIMEOUT) {
+                    emptyQueueTimeouts_.fetch_add(
+                        1,
+                        std::memory_order_relaxed
+                    );
+                } else {
+                    emptyQueueWaitErrors_.fetch_add(
+                        1,
+                        std::memory_order_relaxed
+                    );
+                }
             } else {
                 std::this_thread::sleep_for(
                     std::chrono::milliseconds(2)
+                );
+
+                emptyQueueTimeouts_.fetch_add(
+                    1,
+                    std::memory_order_relaxed
                 );
             }
 
@@ -1026,6 +1184,10 @@ void RealtimeRtpSender::senderLoop()
                 }
 
                 batch.push(&packet);
+                packetsProcessedByLoop_.fetch_add(
+                    1,
+                    std::memory_order_relaxed
+                );
             } else {
                 packetsDropped_.fetch_add(1, std::memory_order_relaxed);
             }
@@ -1041,6 +1203,11 @@ void RealtimeRtpSender::senderLoop()
         const uint32_t queueSize = static_cast<uint32_t>(
             publishSequence_.load(std::memory_order_acquire) -
             consumeSequence_.load(std::memory_order_acquire)
+        );
+
+        pacingCalls_.fetch_add(
+            1,
+            std::memory_order_relaxed
         );
 
         pacer_.pace(
