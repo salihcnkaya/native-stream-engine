@@ -12,7 +12,7 @@ namespace {
 struct NativeRtpOutputContext {
     obs_output_t* output = nullptr;
     std::atomic<bool> active{ false };
-    uint64_t packetCount = 0;
+    std::atomic<uint64_t> packetCount{ 0 };
 };
 
 std::atomic<NativeEncodedPacketHandler>
@@ -62,7 +62,9 @@ void destroyOutput(void* data)
     std::cerr
         << "[Native RTP Output] destroyed"
         << " packets="
-        << context->packetCount
+        << context->packetCount.load(
+            std::memory_order_relaxed
+        )
         << "\n";
 
     delete context;
@@ -118,7 +120,10 @@ bool startOutput(void* data)
         return false;
     }
 
-    context->packetCount = 0;
+    context->packetCount.store(
+        0,
+        std::memory_order_relaxed
+    );
 
     if (
         !obs_output_begin_data_capture(
@@ -175,7 +180,9 @@ void stopOutput(
     std::cerr
         << "[Native RTP Output] stopped"
         << " packets="
-        << context->packetCount
+        << context->packetCount.load(
+                std::memory_order_relaxed
+            )
         << "\n";
 }
 
@@ -208,7 +215,10 @@ void receiveEncodedPacket(
         return;
     }
 
-    context->packetCount++;
+    context->packetCount.fetch_add(
+        1,
+        std::memory_order_relaxed
+    );
     handler(packet);
 }
 
