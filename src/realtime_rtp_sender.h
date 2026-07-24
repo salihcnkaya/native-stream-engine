@@ -127,6 +127,7 @@ private:
 
     std::thread senderThread_;
     HANDLE packetAvailableEvent_ = nullptr;
+    WSAEVENT socketReadEvent_ = WSA_INVALID_EVENT;
 
     std::atomic<uint64_t> packetsQueued_{ 0 };
     std::atomic<uint64_t> packetsSent_{ 0 };

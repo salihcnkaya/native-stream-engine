@@ -262,6 +262,55 @@ bool RealtimeRtpSender::start(
 
         return false;
     }
+
+    if (label_ == "video") {
+        socketReadEvent_ = WSACreateEvent();
+
+        if (socketReadEvent_ == WSA_INVALID_EVENT) {
+            std::cerr
+                << "[Realtime RTP Sender:"
+                << label_
+                << "] WSACreateEvent failed, error="
+                << WSAGetLastError()
+                << "\n";
+
+            CloseHandle(packetAvailableEvent_);
+            packetAvailableEvent_ = nullptr;
+
+            closesocket(socket_);
+            socket_ = INVALID_SOCKET;
+
+            WSACleanup();
+            return false;
+        }
+
+        if (
+            WSAEventSelect(
+                socket_,
+                socketReadEvent_,
+                FD_READ
+            ) == SOCKET_ERROR
+        ) {
+            std::cerr
+                << "[Realtime RTP Sender:"
+                << label_
+                << "] WSAEventSelect failed, error="
+                << WSAGetLastError()
+                << "\n";
+
+            WSACloseEvent(socketReadEvent_);
+            socketReadEvent_ = WSA_INVALID_EVENT;
+
+            CloseHandle(packetAvailableEvent_);
+            packetAvailableEvent_ = nullptr;
+
+            closesocket(socket_);
+            socket_ = INVALID_SOCKET;
+
+            WSACleanup();
+            return false;
+        }
+    }
     
     running_ = true;
     senderThreadRunning_ = true;
@@ -292,6 +341,11 @@ void RealtimeRtpSender::stop()
 
     if (senderThread_.joinable()) {
         senderThread_.join();
+    }
+
+    if (socketReadEvent_ != WSA_INVALID_EVENT) {
+        WSACloseEvent(socketReadEvent_);
+        socketReadEvent_ = WSA_INVALID_EVENT;
     }
 
     if (packetAvailableEvent_) {
@@ -1039,16 +1093,22 @@ void RealtimeRtpSender::senderLoop()
                 std::memory_order_relaxed
             );
 
-            if (packetAvailableEvent_) {
-                const DWORD waitTimeout =
-                    label_ == "video"
-                        ? 2
-                        : INFINITE;
+            if (
+                label_ == "video" &&
+                packetAvailableEvent_ &&
+                socketReadEvent_ != WSA_INVALID_EVENT
+            ) {
+                HANDLE waitHandles[2] = {
+                    packetAvailableEvent_,
+                    socketReadEvent_
+                };
 
                 const DWORD waitResult =
-                    WaitForSingleObject(
-                        packetAvailableEvent_,
-                        waitTimeout
+                    WaitForMultipleObjects(
+                        2,
+                        waitHandles,
+                        FALSE,
+                        INFINITE
                     );
 
                 if (waitResult == WAIT_OBJECT_0) {
@@ -1056,8 +1116,43 @@ void RealtimeRtpSender::senderLoop()
                         1,
                         std::memory_order_relaxed
                     );
-                } else if (waitResult == WAIT_TIMEOUT) {
-                    emptyQueueTimeouts_.fetch_add(
+                } else if (
+                    waitResult == WAIT_OBJECT_0 + 1
+                ) {
+                    WSANETWORKEVENTS networkEvents{};
+
+                    if (
+                        WSAEnumNetworkEvents(
+                            socket_,
+                            socketReadEvent_,
+                            &networkEvents
+                        ) == SOCKET_ERROR
+                    ) {
+                        emptyQueueWaitErrors_.fetch_add(
+                            1,
+                            std::memory_order_relaxed
+                        );
+                    } else if (
+                        networkEvents.lNetworkEvents &
+                        FD_READ
+                    ) {
+                        drainIncomingControlPackets();
+                    }
+                } else {
+                    emptyQueueWaitErrors_.fetch_add(
+                        1,
+                        std::memory_order_relaxed
+                    );
+                }
+            } else if (packetAvailableEvent_) {
+                const DWORD waitResult =
+                    WaitForSingleObject(
+                        packetAvailableEvent_,
+                        INFINITE
+                    );
+
+                if (waitResult == WAIT_OBJECT_0) {
+                    emptyQueueSignals_.fetch_add(
                         1,
                         std::memory_order_relaxed
                     );
