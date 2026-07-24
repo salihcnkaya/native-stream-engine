@@ -1276,29 +1276,40 @@ bool ObsEngine::createProcessAudioSource(uintptr_t hwnd)
     return true;
 }
 
-static void rtpPacketCallback(
-	obs_output_t*,
-	encoder_packet* packet,
-	encoder_packet_time*,
-	void*
+static void handleRtpEncodedPacket(
+    encoder_packet* packet
 )
 {
-    if (!packet) return;
-    if (!packet->data || packet->size == 0) return;
-    if (packet->timebase_den == 0) return;
+    if (!packet) {
+        return;
+    }
+
+    if (
+        !packet->data ||
+        packet->size == 0 ||
+        packet->timebase_den == 0
+    ) {
+        return;
+    }
 
     if (packet->type == OBS_ENCODER_AUDIO) {
-
         if (!g_firstAudioPtsSet) {
             g_firstAudioPts = packet->pts;
             g_firstAudioPtsSet = true;
         }
 
-        const int64_t audioPtsDelta = packet->pts - g_firstAudioPts;
+        const int64_t audioPtsDelta =
+            packet->pts - g_firstAudioPts;
 
-        const uint32_t audioRtpTimestamp = static_cast<uint32_t>(
-            (audioPtsDelta * 48000LL * packet->timebase_num) / packet->timebase_den
-        );
+        const uint32_t audioRtpTimestamp =
+            static_cast<uint32_t>(
+                (
+                    audioPtsDelta *
+                    48000LL *
+                    packet->timebase_num
+                ) /
+                packet->timebase_den
+            );
 
         g_realtimeRtpAudioSender.sendEncodedPayload(
             packet->data,
@@ -1310,9 +1321,11 @@ static void rtpPacketCallback(
         return;
     }
 
-    if (packet->type != OBS_ENCODER_VIDEO) return;
+    if (packet->type != OBS_ENCODER_VIDEO) {
+        return;
+    }
 
-	g_rtpPacketCount++;
+    g_rtpPacketCount++;
 
     if (
         STREAM_DEBUG_KEYFRAME_REQUESTS &&
@@ -1327,22 +1340,39 @@ static void rtpPacketCallback(
             << "\n";
     }
 
-	if (!g_firstVideoPtsSet) {
-		g_firstVideoPts = packet->pts;
-		g_firstVideoPtsSet = true;
-	}
+    if (!g_firstVideoPtsSet) {
+        g_firstVideoPts = packet->pts;
+        g_firstVideoPtsSet = true;
+    }
 
-	const int64_t ptsDelta = packet->pts - g_firstVideoPts;
+    const int64_t ptsDelta =
+        packet->pts - g_firstVideoPts;
 
-	const uint32_t rtpTimestamp = static_cast<uint32_t>(
-		(ptsDelta * 90000LL * packet->timebase_num) / packet->timebase_den
-	);
+    const uint32_t rtpTimestamp =
+        static_cast<uint32_t>(
+            (
+                ptsDelta *
+                90000LL *
+                packet->timebase_num
+            ) /
+                packet->timebase_den
+        );
 
-	sendAnnexBNalsAsRtp(
-		packet->data,
-		packet->size,
-		rtpTimestamp
-	);
+    sendAnnexBNalsAsRtp(
+        packet->data,
+        packet->size,
+        rtpTimestamp
+    );
+}
+
+static void rtpPacketCallback(
+    obs_output_t*,
+    encoder_packet* packet,
+    encoder_packet_time*,
+    void*
+)
+{
+    handleRtpEncodedPacket(packet);
 }
 
 bool ObsEngine::startRtpStreaming(
