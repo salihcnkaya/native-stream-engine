@@ -1040,10 +1040,15 @@ void RealtimeRtpSender::senderLoop()
             );
 
             if (packetAvailableEvent_) {
+                const DWORD waitTimeout =
+                    label_ == "video"
+                        ? 2
+                        : INFINITE;
+
                 const DWORD waitResult =
                     WaitForSingleObject(
                         packetAvailableEvent_,
-                        2
+                        waitTimeout
                     );
 
                 if (waitResult == WAIT_OBJECT_0) {
