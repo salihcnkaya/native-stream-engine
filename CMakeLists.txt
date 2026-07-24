@@ -84,6 +84,7 @@ add_executable(native-stream-engine
     src/bitrate_update_scheduler.cpp
     src/image_utils.cpp
     src/base64_utils.cpp
+    src/rtp_output.cpp
 )
 
 target_include_directories(

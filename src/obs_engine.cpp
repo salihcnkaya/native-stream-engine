@@ -17,6 +17,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <mutex>
+#include "rtp_output.h"
 
 namespace fs = std::filesystem;
 
@@ -40,6 +41,10 @@ static int64_t g_firstAudioPts = 0;
 static bool g_firstAudioPtsSet = false;
 static RealtimeRtpSender g_realtimeRtpSender;
 static RealtimeRtpSender g_realtimeRtpAudioSender;
+
+static void handleRtpEncodedPacket(
+    encoder_packet* packet
+);
 
 #if defined(NDEBUG)
 static constexpr bool STREAM_DEBUG_BITRATE_DECISIONS = false;
@@ -831,7 +836,14 @@ bool ObsEngine::initialize(
     }
 
     obs_post_load_modules();
-	registerWgcSource();
+
+    registerWgcSource();
+
+    setNativeRtpOutputPacketHandler(
+        handleRtpEncodedPacket
+    );
+
+    registerNativeRtpOutput();
 
     if (!configureVideo(videoConfig)) {
         obs_shutdown();
