@@ -90,3 +90,5 @@ EXPORTS
     obs_source_create_private
     base_set_log_handler
     obs_output_get_last_error
+    obs_output_can_begin_data_capture
+    obs_output_initialize_encoders

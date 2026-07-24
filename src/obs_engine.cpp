@@ -1377,16 +1377,6 @@ static void handleRtpEncodedPacket(
     );
 }
 
-static void rtpPacketCallback(
-    obs_output_t*,
-    encoder_packet* packet,
-    encoder_packet_time*,
-    void*
-)
-{
-    handleRtpEncodedPacket(packet);
-}
-
 bool ObsEngine::startRtpStreaming(
     const std::string& rtpIp,
     uint16_t rtpPort,
@@ -1511,7 +1501,7 @@ bool ObsEngine::startRtpStreaming(
             << "\n";
     }
 
-    bool packetTapOutputStarted = false;
+    bool nativeOutputStarted = false;
 
     for (const auto& candidate : encoderCandidates) {
         std::cerr
@@ -1560,24 +1550,12 @@ bool ObsEngine::startRtpStreaming(
             obs_get_video()
         );
 
-        obs_data_t* outputSettings =
-            obs_data_create();
-
-        obs_data_set_string(
-            outputSettings,
-            "path",
-            "NUL.mkv"
+        g_rtpOutput = obs_output_create(
+            "native_rtp_output",
+            "Native RTP Output",
+            nullptr,
+            nullptr
         );
-
-        g_rtpOutput =
-            obs_output_create(
-                "ffmpeg_muxer",
-                "RTP Packet Tap Output",
-                outputSettings,
-                nullptr
-            );
-
-        obs_data_release(outputSettings);
 
         if (!g_rtpOutput) {
             std::cerr
@@ -1648,12 +1626,6 @@ bool ObsEngine::startRtpStreaming(
             );
         }
 
-        obs_output_add_packet_callback(
-            g_rtpOutput,
-            rtpPacketCallback,
-            nullptr
-        );
-
         if (!obs_output_start(g_rtpOutput)) {
             const char* outputError =
                 obs_output_get_last_error(
@@ -1673,12 +1645,6 @@ bool ObsEngine::startRtpStreaming(
                 )
                 << "\n";
 
-            obs_output_remove_packet_callback(
-                g_rtpOutput,
-                rtpPacketCallback,
-                nullptr
-            );
-
             if (
                 obs_output_active(
                     g_rtpOutput
@@ -1691,15 +1657,10 @@ bool ObsEngine::startRtpStreaming(
 
             releaseRtpStreamingResources();
 
-            /*
-            * En Ã¶nemli yeni davranÄ±ÅŸ:
-            * encoder nesnesi oluÅŸturulmuÅŸ olsa bile gerÃ§ek output
-            * baÅŸlangÄ±cÄ± baÅŸarÄ±sÄ±zsa sonraki encoder adayÄ±na geÃ§ilir.
-            */
             continue;
         }
 
-        packetTapOutputStarted = true;
+        nativeOutputStarted = true;
 
         std::cerr
             << "[Realtime RTP] video encoder selected"
@@ -1709,7 +1670,7 @@ bool ObsEngine::startRtpStreaming(
             << "\n";
 
         std::cerr
-            << "[Realtime RTP] packet tap output started"
+            << "[Realtime RTP] native output started"
             << " encoderId=" << candidate.id
             << " family=" << candidate.family
             << "\n";
@@ -1717,7 +1678,7 @@ bool ObsEngine::startRtpStreaming(
         break;
     }
 
-    if (!packetTapOutputStarted) {
+    if (!nativeOutputStarted) {
         std::cerr
             << "[Realtime RTP] all video encoder runtime attempts failed"
             << " requestedEncoder=" << encoder
@@ -1756,11 +1717,6 @@ void ObsEngine::stopRtpStreaming()
     stopActiveRtpSenders();
 
     if (g_rtpOutput) {
-        obs_output_remove_packet_callback(
-            g_rtpOutput,
-            rtpPacketCallback,
-            nullptr
-        );
 
         if (obs_output_active(g_rtpOutput)) {
             obs_output_stop(g_rtpOutput);

@@ -79,9 +79,11 @@ bool startOutput(void* data)
         return false;
     }
 
-    if (!g_packetHandler.load(
-        std::memory_order_acquire
-    )) {
+    if (
+        !g_packetHandler.load(
+            std::memory_order_acquire
+        )
+    ) {
         std::cerr
             << "[Native RTP Output] "
             << "start rejected"
@@ -90,27 +92,51 @@ bool startOutput(void* data)
         return false;
     }
 
+    if (
+        !obs_output_can_begin_data_capture(
+            context->output,
+            0
+        )
+    ) {
+        std::cerr
+            << "[Native RTP Output] "
+            << "cannot begin data capture\n";
+
+        return false;
+    }
+
+    if (
+        !obs_output_initialize_encoders(
+            context->output,
+            0
+        )
+    ) {
+        std::cerr
+            << "[Native RTP Output] "
+            << "encoder initialization failed\n";
+
+        return false;
+    }
+
     context->packetCount = 0;
-    context->active.store(
-        true,
-        std::memory_order_release
-    );
 
-    if (!obs_output_begin_data_capture(
-        context->output,
-        0
-    )) {
-        context->active.store(
-            false,
-            std::memory_order_release
-        );
-
+    if (
+        !obs_output_begin_data_capture(
+            context->output,
+            0
+        )
+    ) {
         std::cerr
             << "[Native RTP Output] "
             << "begin data capture failed\n";
 
         return false;
     }
+
+    context->active.store(
+        true,
+        std::memory_order_release
+    );
 
     std::cerr
         << "[Native RTP Output] started\n";
