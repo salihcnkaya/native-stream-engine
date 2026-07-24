@@ -1,6 +1,16 @@
 #include "rtp_pacer.h"
 #include <iostream>
 
+void RtpPacer::resetTelemetry()
+{
+    telemetry_ = {};
+}
+
+RtpPacerTelemetry RtpPacer::telemetry() const
+{
+    return telemetry_;
+}
+
 void RtpPacer::setInitialBitrate(uint32_t bitrateBps)
 {
     std::lock_guard<std::mutex> lock(stateMutex_);
@@ -155,16 +165,50 @@ void RtpPacer::wait(
 {
     nextSendTime += spacing;
 
+    const auto waitStartedAt =
+        std::chrono::steady_clock::now();
+
+    uint64_t yieldIterations = 0;
+
     while (
         shouldRun.load(std::memory_order_acquire) &&
         std::chrono::steady_clock::now() < nextSendTime
     ) {
         Sleep(0);
+        yieldIterations++;
     }
 
     const auto now = std::chrono::steady_clock::now();
 
+    const auto waitedUs =
+        std::chrono::duration_cast<
+            std::chrono::microseconds
+        >(
+            now - waitStartedAt
+        ).count();
+
+    telemetry_.waitCalls++;
+    telemetry_.yieldIterations +=
+        yieldIterations;
+
+    if (waitedUs > 0) {
+        const uint64_t waitedUsUnsigned =
+            static_cast<uint64_t>(waitedUs);
+
+        telemetry_.totalWaitUs +=
+            waitedUsUnsigned;
+
+        if (
+            waitedUsUnsigned >
+            telemetry_.maxWaitUs
+        ) {
+            telemetry_.maxWaitUs =
+                waitedUsUnsigned;
+        }
+    }
+
     if (nextSendTime < now - std::chrono::milliseconds(5)) {
+        telemetry_.lateResets++;
         nextSendTime = now;
     }
 }

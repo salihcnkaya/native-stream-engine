@@ -24,6 +24,14 @@ struct RtpPacerConfig {
     std::chrono::microseconds audioQ300 { 5 };
 };
 
+struct RtpPacerTelemetry {
+    uint64_t waitCalls = 0;
+    uint64_t yieldIterations = 0;
+    uint64_t lateResets = 0;
+    uint64_t totalWaitUs = 0;
+    uint64_t maxWaitUs = 0;
+};
+
 class RtpPacer {
 public:
     RtpPacer() = default;
@@ -59,6 +67,10 @@ public:
     BitrateDecision bitrateDecision() const;
     void setInitialBitrate(uint32_t bitrateBps);
 
+    void resetTelemetry();
+
+    RtpPacerTelemetry telemetry() const;
+
 private:
     RtpPacerConfig config_{};
 
@@ -70,4 +82,5 @@ private:
     
     std::atomic<bool> adaptiveVideoActive_{ false };
     std::atomic<uint32_t> adaptiveVideoExtraUs_{ 0 };
+    mutable RtpPacerTelemetry telemetry_{};
 };

@@ -147,6 +147,8 @@ void RealtimeRtpSender::resetStats()
         std::memory_order_relaxed
     );
 
+    pacer_.resetTelemetry();
+
     for (auto& seq : lastRetransmitSeqs_) {
         seq = 0xffff;
     }
@@ -370,6 +372,21 @@ void RealtimeRtpSender::stop()
             ? totalQueueLatencyMs_.load(std::memory_order_relaxed) /
                 latencySamples
             : 0;
+    
+    const auto pacerTelemetry =
+        pacer_.telemetry();
+
+    const uint64_t averagePacingWaitUs =
+        pacerTelemetry.waitCalls > 0
+            ? pacerTelemetry.totalWaitUs /
+                pacerTelemetry.waitCalls
+            : 0;
+
+    const uint64_t averageYieldsPerWait =
+        pacerTelemetry.waitCalls > 0
+            ? pacerTelemetry.yieldIterations /
+                pacerTelemetry.waitCalls
+            : 0;
 
     std::cerr
         << "[Realtime RTP Sender:"
@@ -423,6 +440,18 @@ void RealtimeRtpSender::stop()
         << emptyQueueWaitErrors_.load(
             std::memory_order_relaxed
         )
+        << " pacerWaitCalls="
+        << pacerTelemetry.waitCalls
+        << " pacerYieldIterations="
+        << pacerTelemetry.yieldIterations
+        << " avgPacerWaitUs="
+        << averagePacingWaitUs
+        << " maxPacerWaitUs="
+        << pacerTelemetry.maxWaitUs
+        << " avgYieldsPerWait="
+        << averageYieldsPerWait
+        << " pacerLateResets="
+        << pacerTelemetry.lateResets
         << "\n";
 }
 
@@ -1076,7 +1105,7 @@ void RealtimeRtpSender::senderLoop()
     
     pacer_.logBaseline(label_, MAX_BATCH_PACKETS);
 
-    while (senderThreadRunning_) {
+    while (true) {
         senderLoopIterations_.fetch_add(
             1,
             std::memory_order_relaxed
@@ -1085,9 +1114,19 @@ void RealtimeRtpSender::senderLoop()
         const uint64_t readSeq = consumeSequence_.load(std::memory_order_relaxed);
         const uint64_t writeSeq = publishSequence_.load(std::memory_order_acquire);
 
-        if (readSeq == writeSeq) {
-            nextSendTime = clock::now();
+        const bool shouldContinueRunning =
+            senderThreadRunning_.load(
+                std::memory_order_acquire
+            );
 
+        if (
+            !shouldContinueRunning &&
+            readSeq == writeSeq
+        ) {
+            break;
+        }
+
+        if (readSeq == writeSeq) {
             emptyQueueWaits_.fetch_add(
                 1,
                 std::memory_order_relaxed
@@ -1172,6 +1211,7 @@ void RealtimeRtpSender::senderLoop()
                     std::memory_order_relaxed
                 );
             }
+            nextSendTime = clock::now();
 
             continue;
         }
