@@ -27,6 +27,7 @@ struct RtpPacerConfig {
 struct RtpPacerTelemetry {
     uint64_t waitCalls = 0;
     uint64_t yieldIterations = 0;
+    uint64_t spinIterations = 0;
     uint64_t lateResets = 0;
     uint64_t totalWaitUs = 0;
     uint64_t maxWaitUs = 0;

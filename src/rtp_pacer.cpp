@@ -163,22 +163,44 @@ void RtpPacer::wait(
     std::chrono::microseconds spacing
 ) const
 {
+    using clock = std::chrono::steady_clock;
+
     nextSendTime += spacing;
 
-    const auto waitStartedAt =
-        std::chrono::steady_clock::now();
+    const auto waitStartedAt = clock::now();
 
     uint64_t yieldIterations = 0;
+    uint64_t spinIterations = 0;
+
+    bool schedulerYieldUsed = false;
+
+    constexpr auto SPIN_THRESHOLD = std::chrono::microseconds(20);
 
     while (
-        shouldRun.load(std::memory_order_acquire) &&
-        std::chrono::steady_clock::now() < nextSendTime
+        shouldRun.load(std::memory_order_acquire)
     ) {
-        Sleep(0);
-        yieldIterations++;
+        const auto now = clock::now();
+
+        if (now >= nextSendTime) {
+            break;
+        }
+
+        const auto remaining = nextSendTime - now;
+
+        if (!schedulerYieldUsed && remaining > SPIN_THRESHOLD) {
+            Sleep(0);
+
+            schedulerYieldUsed = true;
+            yieldIterations++;
+
+            continue;
+        }
+
+        YieldProcessor();
+        spinIterations++;
     }
 
-    const auto now = std::chrono::steady_clock::now();
+    const auto now = clock::now();
 
     const auto waitedUs =
         std::chrono::duration_cast<
@@ -190,6 +212,9 @@ void RtpPacer::wait(
     telemetry_.waitCalls++;
     telemetry_.yieldIterations +=
         yieldIterations;
+    
+    telemetry_.spinIterations +=
+        spinIterations;
 
     if (waitedUs > 0) {
         const uint64_t waitedUsUnsigned =

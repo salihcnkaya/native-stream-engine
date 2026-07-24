@@ -444,6 +444,8 @@ void RealtimeRtpSender::stop()
         << pacerTelemetry.waitCalls
         << " pacerYieldIterations="
         << pacerTelemetry.yieldIterations
+        << " pacerSpinIterations="
+        << pacerTelemetry.spinIterations
         << " avgPacerWaitUs="
         << averagePacingWaitUs
         << " maxPacerWaitUs="
