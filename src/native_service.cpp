@@ -31,6 +31,8 @@ static std::atomic<bool> g_captureEndedNotified = false;
 
 static std::mutex g_stdoutMutex;
 
+static constexpr uint32_t PICKER_PREVIEW_FRAME_TIMEOUT_MS = 400;
+
 static void shutdown_engine_state()
 {
     /*
@@ -685,7 +687,7 @@ int runNativeService()
 
 						if (
 								!g_engine->waitForCaptureFrame(
-										5000,
+										PICKER_PREVIEW_FRAME_TIMEOUT_MS,
 										sourceWidth,
 										sourceHeight
 								)
