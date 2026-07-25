@@ -438,6 +438,7 @@ int runNativeService()
 								response += "\"hwnd\":" + std::to_string(w.hwnd) + ",";
 								response += "\"pid\":" + std::to_string(w.pid) + ",";
 								response += "\"exe\":\"" + json_escape(w.exeName) + "\",";
+								response += "\"exePath\":\"" + json_escape(w.exePath) + "\",";
 								response += "\"className\":\"" + json_escape(w.className) + "\",";
 								response += "\"title\":\"" + json_escape(w.title) + "\"";
 								response += "}";

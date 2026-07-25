@@ -50,33 +50,59 @@ static std::string getClassNameUtf8(HWND hwnd)
     return wideToUtf8(buffer);
 }
 
-static std::string getExeNameFromPid(DWORD pid)
+static std::string getExePathFromPid(DWORD pid)
 {
     HANDLE process = OpenProcess(
-        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+        PROCESS_QUERY_LIMITED_INFORMATION,
         FALSE,
         pid
     );
 
-    if (!process) return {};
+    if (!process) {
+        return {};
+    }
 
-    wchar_t path[MAX_PATH] = {};
-    DWORD size = MAX_PATH;
+    std::wstring path;
+    path.resize(32768);
 
-    std::string exeName;
+    DWORD size =
+        static_cast<DWORD>(path.size());
 
-    if (QueryFullProcessImageNameW(process, 0, path, &size)) {
-        std::wstring fullPath(path);
-        size_t pos = fullPath.find_last_of(L"\\/");
-        std::wstring fileName = pos == std::wstring::npos
-            ? fullPath
-            : fullPath.substr(pos + 1);
+    std::string result;
 
-        exeName = wideToUtf8(fileName);
+    if (
+        QueryFullProcessImageNameW(
+            process,
+            0,
+            path.data(),
+            &size
+        )
+    ) {
+        path.resize(size);
+        result = wideToUtf8(path);
     }
 
     CloseHandle(process);
-    return exeName;
+
+    return result;
+}
+
+static std::string getExeNameFromPath(
+    const std::string& exePath
+)
+{
+    if (exePath.empty()) {
+        return {};
+    }
+
+    const size_t position =
+        exePath.find_last_of("\\/");
+
+    if (position == std::string::npos) {
+        return exePath;
+    }
+
+    return exePath.substr(position + 1);
 }
 
 static std::string toLowerAscii(std::string value)
@@ -132,8 +158,14 @@ static BOOL CALLBACK enumWindowsProc(HWND hwnd, LPARAM lParam)
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
 
+    // const std::string exeName =
+    //     getExeNameFromPid(pid);
+
+    const std::string exePath =
+        getExePathFromPid(pid);
+
     const std::string exeName =
-        getExeNameFromPid(pid);
+        getExeNameFromPath(exePath);
 
     if (shouldHideWindowExe(exeName)) {
         return TRUE;
@@ -145,6 +177,7 @@ static BOOL CALLBACK enumWindowsProc(HWND hwnd, LPARAM lParam)
     info.title = title;
     info.className = getClassNameUtf8(hwnd);
     info.exeName = exeName;
+    info.exePath = exePath;
 
     const std::string normalizedExe =
     toLowerAscii(info.exeName);
@@ -208,7 +241,9 @@ bool findWindowByHwnd(uintptr_t hwndValue, WindowInfo& out)
     out.pid = static_cast<uint32_t>(pid);
     out.title = getWindowTextUtf8(hwnd);
     out.className = getClassNameUtf8(hwnd);
-    out.exeName = getExeNameFromPid(pid);
+    // out.exeName = getExeNameFromPid(pid);
+    out.exePath = getExePathFromPid(pid);
+    out.exeName = getExeNameFromPath(out.exePath);
 
     return !out.title.empty() && !out.className.empty();
 }

@@ -10,6 +10,7 @@ struct WindowInfo {
     std::string title;
     std::string className;
     std::string exeName;
+    std::string exePath;
 };
 
 std::vector<WindowInfo> listVisibleWindows();
