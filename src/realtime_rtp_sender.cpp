@@ -6,8 +6,8 @@
 
 #pragma comment(lib, "Ws2_32.lib")
 
-static constexpr bool STREAM_DEBUG_RTP_STATS = false;
-static constexpr bool STREAM_DEBUG_RTCP_NACK = false;
+static constexpr bool STREAM_DEBUG_RTP_STATS = true;
+static constexpr bool STREAM_DEBUG_RTCP_NACK = true;
 static constexpr bool STREAM_DEBUG_RTCP_TWCC = false;
 
 RealtimeRtpSender::RealtimeRtpSender() = default;
@@ -164,7 +164,9 @@ bool RealtimeRtpSender::start(
     const std::string& ip,
     uint16_t port,
     uint8_t payloadType,
-    uint32_t ssrc
+    uint32_t ssrc,
+    uint32_t rtxSsrc,
+    uint8_t rtxPayloadType
 )
 {
     if (running_) {
@@ -175,6 +177,17 @@ bool RealtimeRtpSender::start(
     port_ = port;
     payloadType_ = payloadType;
     ssrc_ = ssrc;
+
+    rtxEnabled_ = rtxSsrc != 0 && rtxPayloadType != 0;
+    rtxSsrc_ = rtxSsrc;
+    rtxPayloadType_ = rtxPayloadType;
+    rtxSequenceNumber_ = 1;
+
+    std::cerr << "[Realtime RTP Sender:" << label_
+              << "] rtx " << (rtxEnabled_ ? "enabled" : "disabled")
+              << " rtxSsrc=" << rtxSsrc_
+              << " rtxPayloadType=" << static_cast<int>(rtxPayloadType_)
+              << "\n";
 
     resetStats();
 
@@ -987,7 +1000,9 @@ bool RealtimeRtpSender::retransmitPacket(uint16_t rtpSequenceNumber)
 
     packet.size = slot.size;
 
-    const bool ok = sendRawPacketInternal(packet, false);
+    const bool ok = rtxEnabled_
+        ? sendRtxPacket(slot)
+        : sendRawPacketInternal(packet, false);
 
     if (ok) {
         historyPacketsRetransmitted_.fetch_add(1, std::memory_order_relaxed);
@@ -996,6 +1011,77 @@ bool RealtimeRtpSender::retransmitPacket(uint16_t rtpSequenceNumber)
     }
 
     return ok;
+}
+
+bool RealtimeRtpSender::sendRtxPacket(const HistoryPacket& slot)
+{
+    const size_t ORIGINAL_RTP_HEADER_SIZE =
+        (label_ == "video") ? RTP_TWCC_HEADER_SIZE : RTP_HEADER_SIZE;
+    static constexpr size_t RTX_HEADER_SIZE = RTP_HEADER_SIZE;
+    static constexpr size_t OSN_SIZE = 2;
+
+    if (slot.size <= ORIGINAL_RTP_HEADER_SIZE) {
+        return false;
+    }
+
+    const size_t originalPayloadSize =
+        static_cast<size_t>(slot.size) - ORIGINAL_RTP_HEADER_SIZE;
+
+    const size_t rtxPacketSize =
+        RTX_HEADER_SIZE + OSN_SIZE + originalPayloadSize;
+
+    if (rtxPacketSize > MAX_RTP_PACKET_SIZE) {
+        return false;
+    }
+
+    const bool originalMarker =
+        (slot.data[1] & 0x80) != 0;
+
+    const uint32_t originalTimestamp =
+        (static_cast<uint32_t>(slot.data[4]) << 24) |
+        (static_cast<uint32_t>(slot.data[5]) << 16) |
+        (static_cast<uint32_t>(slot.data[6]) << 8) |
+        static_cast<uint32_t>(slot.data[7]);
+
+    RtpPacket rtxPacket {};
+    rtxPacket.size = static_cast<uint16_t>(rtxPacketSize);
+
+    const uint16_t rtxSequenceNumber =
+        rtxSequenceNumber_.fetch_add(1);
+
+    rtxPacket.data[0] = 0x80;
+    rtxPacket.data[1] = static_cast<uint8_t>(
+        (originalMarker ? 0x80 : 0x00) | rtxPayloadType_
+    );
+
+    rtxPacket.data[2] = static_cast<uint8_t>((rtxSequenceNumber >> 8) & 0xff);
+    rtxPacket.data[3] = static_cast<uint8_t>(rtxSequenceNumber & 0xff);
+
+    rtxPacket.data[4] = static_cast<uint8_t>((originalTimestamp >> 24) & 0xff);
+    rtxPacket.data[5] = static_cast<uint8_t>((originalTimestamp >> 16) & 0xff);
+    rtxPacket.data[6] = static_cast<uint8_t>((originalTimestamp >> 8) & 0xff);
+    rtxPacket.data[7] = static_cast<uint8_t>(originalTimestamp & 0xff);
+
+    rtxPacket.data[8] = static_cast<uint8_t>((rtxSsrc_ >> 24) & 0xff);
+    rtxPacket.data[9] = static_cast<uint8_t>((rtxSsrc_ >> 16) & 0xff);
+    rtxPacket.data[10] = static_cast<uint8_t>((rtxSsrc_ >> 8) & 0xff);
+    rtxPacket.data[11] = static_cast<uint8_t>(rtxSsrc_ & 0xff);
+
+    // OSN (Original Sequence Number), buyuk-endian.
+    rtxPacket.data[12] = static_cast<uint8_t>(
+        (slot.rtpSequenceNumber >> 8) & 0xff
+    );
+    rtxPacket.data[13] = static_cast<uint8_t>(
+        slot.rtpSequenceNumber & 0xff
+    );
+
+    std::copy(
+        slot.data.begin() + ORIGINAL_RTP_HEADER_SIZE,
+        slot.data.begin() + slot.size,
+        rtxPacket.data.begin() + RTX_HEADER_SIZE + OSN_SIZE
+    );
+
+    return sendRawPacketInternal(rtxPacket, false);
 }
 
 bool RealtimeRtpSender::sendRawPacketInternal(
@@ -1047,6 +1133,43 @@ bool RealtimeRtpSender::sendRawPacketInternal(
 
     packetsSent_.fetch_add(1, std::memory_order_relaxed);
     bytesSent_.fetch_add(packet.size, std::memory_order_relaxed);
+
+    if (label_ == "video") {
+        static std::atomic<int64_t> windowBytes{ 0 };
+        static auto windowStart = std::chrono::steady_clock::now();
+        static constexpr int64_t kWindowMs = 100;
+        // 8 Mbps / 8 = 1,000,000 byte/sn -> 100ms'de ~100,000 byte beklenir.
+        static constexpr int64_t kExpectedBytesPerWindow = 100000;
+
+        windowBytes.fetch_add(packet.size, std::memory_order_relaxed);
+
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsedMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - windowStart
+            ).count();
+
+        if (elapsedMs >= kWindowMs) {
+            const int64_t actualBytes =
+                windowBytes.exchange(0, std::memory_order_relaxed);
+
+            windowStart = now;
+
+            if (actualBytes > kExpectedBytesPerWindow * 2) {
+                const double instantMbps =
+                    (static_cast<double>(actualBytes) * 8.0) /
+                    (static_cast<double>(elapsedMs) / 1000.0) /
+                    1000000.0;
+
+                std::cerr
+                    << "[Realtime RTP Sender:video] burst-check"
+                    << " windowMs=" << elapsedMs
+                    << " bytes=" << actualBytes
+                    << " instantMbps=" << instantMbps
+                    << "\n";
+            }
+        }
+    }
 
     if (storeHistory && label_ == "video") {
         storeHistoryPacket(packet);
@@ -1293,10 +1416,6 @@ void RealtimeRtpSender::senderLoop()
                     ) {
                     }
 
-                    /*
-                    * Sadece video queue 120 ms veya daha fazla gerideyse
-                    * saniyede en fazla bir kez canlÄ± uyarÄ± yaz.
-                    */
                     if (label_ == "video" && latency >= 120) {
                         static thread_local auto lastHighLatencyLogAt =
                             clock::time_point{};
