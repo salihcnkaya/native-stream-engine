@@ -25,7 +25,9 @@ public:
         const std::string& ip,
         uint16_t port,
         uint8_t payloadType,
-        uint32_t ssrc
+        uint32_t ssrc,
+        uint32_t rtxSsrc = 0,
+        uint8_t rtxPayloadType = 0
     );
 
     void stop();
@@ -119,6 +121,11 @@ private:
     uint8_t payloadType_ = 102;
     uint32_t ssrc_ = 0;
 
+    bool rtxEnabled_ = false;
+    uint32_t rtxSsrc_ = 0;
+    uint8_t rtxPayloadType_ = 0;
+    std::atomic<uint16_t> rtxSequenceNumber_{ 1 };
+
     SOCKET socket_ = INVALID_SOCKET;
 
     std::atomic<uint16_t> sequenceNumber_{ 1 };
@@ -186,6 +193,7 @@ private:
     RtpPacer pacer_;
     void storeHistoryPacket(const RtpPacket& packet);
     bool sendRawPacketInternal(const RtpPacket& packet, bool storeHistory);
+    bool sendRtxPacket(const HistoryPacket& slot);
     void drainIncomingControlPackets();
     void handleIncomingControlPacket(const uint8_t* data, int size);
     void handleRtcpGenericNack(const uint8_t* data, int size);
