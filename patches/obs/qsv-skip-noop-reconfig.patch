@@ -1,0 +1,29 @@
+--- a/plugins/obs-qsv11/obs-qsv11.c
++++ b/plugins/obs-qsv11/obs-qsv11.c
+@@ -735,7 +735,25 @@
+ static bool obs_qsv_update(void *data, obs_data_t *settings)
+ {
+ 	struct obs_qsv *obsqsv = data;
+-	obsqsv->params.nTargetBitRate = (mfxU16)obs_data_get_int(settings, "bitrate");
++	const mfxU16 requested_bitrate = (mfxU16)obs_data_get_int(settings, "bitrate");
++
++	/* native-stream-engine patch: stock obs-qsv11 calls
++	 * MFXVideoENCODE_Reset() unconditionally on every obs_encoder_update(),
++	 * even when nothing actually changed (e.g. a routine re-poke with the
++	 * same bitrate). Skip the reset in that no-op case - it is a real
++	 * MSDK session reset and causes a visible encode-pipeline stall.
++	 *
++	 * "__nse_force_idr_only" still forces the (heavier, reset-based) path
++	 * on purpose for genuine PLI-driven keyframe requests, since QSV does
++	 * not yet have a lighter per-frame forceIDR path wired up here. */
++	const bool force_idr_only = obs_data_get_bool(settings, "__nse_force_idr_only");
++	const bool bitrate_unchanged = requested_bitrate == obsqsv->params.nTargetBitRate;
++
++	obsqsv->params.nTargetBitRate = requested_bitrate;
++
++	if (bitrate_unchanged && !force_idr_only) {
++		return true;
++	}
+ 
+ 	if (!qsv_encoder_reconfig(obsqsv->context, &obsqsv->params)) {
+ 		warn("Failed to reconfigure");
