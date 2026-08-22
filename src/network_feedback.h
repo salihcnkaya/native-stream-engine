@@ -17,4 +17,7 @@ struct NetworkFeedback {
     uint32_t nackPacketCount = 0;
     uint32_t pliCount = 0;
     uint32_t firCount = 0;
+
+    bool keyframeRequested = false;
+    bool isNewSubscriberKeyframe = false;
 };
