@@ -647,11 +647,6 @@ bool ObsEngine::configureVideo(
     ovi.fps_num = videoConfig.fps;
     ovi.fps_den = 1;
 
-    /*
-     * Mevcut tasarÄ±mÄ±mÄ±zda OBS canvas ve output,
-     * kullanÄ±cÄ±nÄ±n seÃ§tiÄŸi yayÄ±n Ã§Ã¶zÃ¼nÃ¼rlÃ¼ÄŸÃ¼nde tutuluyor.
-     * WGC source gerÃ§ek kaynak boyutundan canvas iÃ§ine fit ediliyor.
-     */
     ovi.base_width =
         static_cast<uint32_t>(
             videoConfig.outputWidth
@@ -1199,11 +1194,6 @@ static obs_data_t* createRtpVideoEncoderSettings(
             bitrateKbps
         );
 
-        obs_data_set_string(
-            settings,
-            "x264opts",
-            "repeat-headers=1:scenecut=0:bframes=0"
-        );
     }
 
     return settings;
@@ -1370,6 +1360,39 @@ static void handleRtpEncodedPacket(
                 packet->timebase_den
         );
 
+    static auto g_firstVideoWallClock = std::chrono::steady_clock::now();
+    static bool g_firstVideoWallClockSet = false;
+    static uint64_t g_driftLogCounter = 0;
+
+    if (!g_firstVideoWallClockSet) {
+        g_firstVideoWallClock = std::chrono::steady_clock::now();
+        g_firstVideoWallClockSet = true;
+    }
+
+    g_driftLogCounter++;
+
+    if (g_driftLogCounter % 600 == 0) {
+        const double ptsElapsedMs =
+            static_cast<double>(ptsDelta) *
+            1000.0 *
+            packet->timebase_num /
+            packet->timebase_den;
+
+        const auto wallElapsed =
+            std::chrono::steady_clock::now() - g_firstVideoWallClock;
+
+        const double wallElapsedMs =
+            std::chrono::duration<double, std::milli>(wallElapsed).count();
+
+        std::cerr
+            << "[Realtime RTP] drift-check"
+            << " frameNum=" << g_driftLogCounter
+            << " ptsElapsedMs=" << ptsElapsedMs
+            << " wallElapsedMs=" << wallElapsedMs
+            << " driftMs=" << (wallElapsedMs - ptsElapsedMs)
+            << "\n";
+    }
+
     sendAnnexBNalsAsRtp(
         packet->data,
         packet->size,
@@ -1387,7 +1410,9 @@ bool ObsEngine::startRtpStreaming(
     const std::string& audioRtpIp,
     uint16_t audioRtpPort,
     uint8_t audioPayloadType,
-    uint32_t audioSsrc
+    uint32_t audioSsrc,
+    uint32_t rtxSsrc,
+    uint8_t rtxPayloadType
 )
 {
     if (g_rtpStreaming) {
@@ -1441,6 +1466,8 @@ bool ObsEngine::startRtpStreaming(
         << " pt="
         << static_cast<int>(payloadType)
         << " ssrc=" << ssrc
+        << " rtxSsrc=" << rtxSsrc
+        << " rtxPt=" << static_cast<int>(rtxPayloadType)
         << " bitrate=" << bitrate
         << " requestedEncoder=" << encoder
         << "\n";
@@ -1468,7 +1495,9 @@ bool ObsEngine::startRtpStreaming(
             rtpIp,
             rtpPort,
             payloadType,
-            ssrc
+            ssrc,
+            rtxSsrc,
+            rtxPayloadType
         )
     ) {
         return false;
@@ -1510,11 +1539,6 @@ bool ObsEngine::startRtpStreaming(
             << " family=" << candidate.family
             << "\n";
 
-        /*
-        * Her encoder adayÄ± iÃ§in video encoder, output ve audio
-        * encoder sÄ±fÄ±rdan oluÅŸturulur. Ã–nceki adayÄ±n output_start
-        * denemesi baÅŸarÄ±sÄ±zsa hiÃ§bir OBS nesnesi yeniden kullanÄ±lmaz.
-        */
         obs_data_t* videoSettings =
             createRtpVideoEncoderSettings(
                 candidate.family,
@@ -1566,11 +1590,6 @@ bool ObsEngine::startRtpStreaming(
 
             releaseRtpStreamingResources();
 
-            /*
-            * Output oluÅŸturulamamasÄ± encoder'a Ã¶zgÃ¼ olmayabilir.
-            * Yine de mevcut aday tamamen temizlenerek sÄ±radaki aday
-            * denenir. Son adaydan sonra genel baÅŸarÄ±sÄ±zlÄ±k oluÅŸur.
-            */
             continue;
         }
 
@@ -1685,10 +1704,6 @@ bool ObsEngine::startRtpStreaming(
             << " candidateCount=" << encoderCandidates.size()
             << "\n";
 
-        /*
-        * DÃ¶ngÃ¼ iÃ§indeki her baÅŸarÄ±sÄ±z attempt kendi OBS nesnelerini
-        * temizledi. Burada yalnÄ±zca RTP sender'larÄ± kapatÄ±yoruz.
-        */
         stopActiveRtpSenders();
 
         return false;
@@ -1716,27 +1731,14 @@ void ObsEngine::stopRtpStreaming()
     std::cerr
         << "[Realtime RTP] stop requested\n";
 
-    /*
-     * Önce OBS output'u durdur.
-     * Böylece encoder callback'i artık yeni RTP paketi
-     * üretmeye devam etmez.
-     */
     if (g_rtpOutput) {
         if (obs_output_active(g_rtpOutput)) {
             obs_output_stop(g_rtpOutput);
         }
     }
 
-    /*
-     * Output durduktan sonra sender queue'larını kapat.
-     * Böylece output stop sırasında üretilmiş son paketler
-     * sender tarafından işlenebilir.
-     */
     stopActiveRtpSenders();
 
-    /*
-     * Output ve encoder referanslarını son olarak bırak.
-     */
     releaseRtpStreamingResources();
 
     g_lastPliCount = 0;
@@ -1770,9 +1772,14 @@ static bool requestRtpVideoKeyframe(const char* reason)
         std::chrono::steady_clock::now();
 
     constexpr auto KEYFRAME_REQUEST_COOLDOWN =
-        std::chrono::milliseconds(750);
+        std::chrono::milliseconds(2500);
+
+    const bool isNewSubscriberReason =
+        reason != nullptr &&
+        std::strcmp(reason, "new-subscriber") == 0;
 
     if (
+        !isNewSubscriberReason &&
         g_lastKeyframeRequestAt.time_since_epoch().count() != 0 &&
         now - g_lastKeyframeRequestAt <
             KEYFRAME_REQUEST_COOLDOWN
@@ -1822,7 +1829,16 @@ static bool requestRtpVideoKeyframe(const char* reason)
             "obs_nvenc_h264"
         ) == 0;
 
-    if (!isNvenc) {
+    const bool isAmf =
+        std::strcmp(encoderId, "h264_texture_amf") == 0 ||
+        std::strcmp(encoderId, "h265_texture_amf") == 0;
+
+    const bool isQsv =
+        std::strcmp(encoderId, "obs_qsv11_v2") == 0 ||
+        std::strcmp(encoderId, "obs_qsv11_hevc") == 0 ||
+        std::strcmp(encoderId, "obs_qsv11_av1") == 0;
+
+    if (!isNvenc && !isAmf && !isQsv) {
         std::cerr
             << "[Realtime RTP] keyframe request unsupported"
             << " reason="
@@ -1850,11 +1866,17 @@ static bool requestRtpVideoKeyframe(const char* reason)
         return false;
     }
 
-    /*
-    * OBS 32.1.2'de obs_encoder_update() void dÃ¶ner.
-    * NVENC update yolu iÃ§eride encoder reconfigure yapar
-    * ve forceIDR tetikler.
-    */
+    const std::string method =
+        isNvenc ? "nvenc_lightweight_reconfigure" :
+        isAmf ? "amf_force_idr" :
+        "qsv_reconfigure";
+
+    if (isNvenc) {
+        obs_data_set_bool(settings, "__nse_lightweight", true);
+        obs_data_set_bool(settings, "__nse_force_idr_only", true);
+    } else if (isQsv) {
+        obs_data_set_bool(settings, "__nse_force_idr_only", true);
+    }
 
     obs_encoder_update(
         g_rtpVideoEncoder,
@@ -1870,7 +1892,7 @@ static bool requestRtpVideoKeyframe(const char* reason)
         << " reason="
         << (reason ? reason : "unknown")
         << " encoderId=" << encoderId
-        << " method=nvenc_reconfigure"
+        << " method=" << method
         << " cooldownMs="
         << KEYFRAME_REQUEST_COOLDOWN.count()
         << "\n";
@@ -1934,6 +1956,11 @@ static void updateRtpVideoEncoderBitrate(uint32_t bitrateBps)
             "buffer_size",
             bitrateKbps
         );
+    }
+
+    if (encoderFamily == "nvenc") {
+        obs_data_set_bool(settings, "__nse_lightweight", true);
+        obs_data_set_bool(settings, "__nse_force_idr_only", false);
     }
 
     obs_encoder_update(
@@ -2007,9 +2034,6 @@ void ObsEngine::updateNetworkFeedback(
         << "\n";
 }
 
-    const bool hasNewPli =
-        feedback.pliCount > g_lastPliCount;
-
     const bool hasNewFir =
         feedback.firCount > g_lastFirCount;
 
@@ -2017,10 +2041,6 @@ void ObsEngine::updateNetworkFeedback(
         feedback.nackPacketCount >
         g_lastNackPacketCount;
 
-    /*
-     * KarÅŸÄ±laÅŸtÄ±rmalar eski sayaÃ§lara karÅŸÄ± yapÄ±ldÄ±.
-     * Åimdi son gÃ¶rÃ¼len deÄŸerleri gÃ¼ncelliyoruz.
-     */
     g_lastPliCount =
         feedback.pliCount;
 
@@ -2034,13 +2054,15 @@ void ObsEngine::updateNetworkFeedback(
         feedback
     );
 
-    if (hasNewPli || hasNewFir) {
+    if (feedback.keyframeRequested || hasNewFir) {
         const char* reason = nullptr;
 
-        if (hasNewPli && hasNewFir) {
+        if (feedback.isNewSubscriberKeyframe) {
+            reason = "new-subscriber";
+        } else if (feedback.keyframeRequested && hasNewFir) {
             reason = "pli+fir";
-        } else if (hasNewPli) {
-            reason = "pli";
+        } else if (feedback.keyframeRequested) {
+            reason = "pli-corroborated";
         } else {
             reason = "fir";
         }
@@ -2077,11 +2099,6 @@ void ObsEngine::clearCapture()
 
     captureCleared_ = true;
 
-    /*
-     * Ã–nce scene'i OBS output slotlarÄ±ndan ayÄ±r.
-     * BÃ¶ylece output tarafÄ±nÄ±n scene source Ã¼zerindeki
-     * referansÄ± bÄ±rakÄ±lÄ±r.
-     */
     obs_set_output_source(
         0,
         nullptr
@@ -2100,13 +2117,6 @@ void ObsEngine::clearCapture()
         g_audioSource = nullptr;
     }
 
-    /*
-     * Scene item'Ä± aÃ§Ä±kÃ§a kaldÄ±r.
-     *
-     * Bu iÅŸlem scene'in capture source Ã¼zerinde tuttuÄŸu
-     * referansÄ± bÄ±rakÄ±r. obs_sceneitem_remove() sonrasÄ±nda
-     * item pointer'Ä± artÄ±k kullanÄ±lmamalÄ±dÄ±r.
-     */
     if (g_captureSceneItem) {
         obs_sceneitem_remove(
             g_captureSceneItem
@@ -2115,11 +2125,6 @@ void ObsEngine::clearCapture()
         g_captureSceneItem = nullptr;
     }
 
-    /*
-     * obs_source_create() ile aldÄ±ÄŸÄ±mÄ±z creator reference.
-     * Scene item kaldÄ±rÄ±ldÄ±ktan sonra kendi referansÄ±mÄ±zÄ±
-     * bÄ±rakÄ±yoruz.
-     */
     if (g_captureSource) {
         obs_source_release(
             g_captureSource
@@ -2128,10 +2133,6 @@ void ObsEngine::clearCapture()
         g_captureSource = nullptr;
     }
 
-    /*
-     * ArtÄ±k output ve scene item referanslarÄ± yok.
-     * Son olarak scene'in oluÅŸturucu referansÄ±nÄ± bÄ±rak.
-     */
     if (g_scene) {
         obs_scene_release(
             g_scene
