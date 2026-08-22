@@ -17,6 +17,7 @@ Makefile
 *.vcxproj.filters
 *.vcxproj.user
 *.sln
+*.diff
 
 # ============================================================
 # Native compiler outputs
