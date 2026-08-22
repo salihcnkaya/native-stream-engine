@@ -63,7 +63,9 @@ public:
         const std::string& audioRtpIp = "",
         uint16_t audioRtpPort = 0,
         uint8_t audioPayloadType = 111,
-        uint32_t audioSsrc = 0
+        uint32_t audioSsrc = 0,
+        uint32_t rtxSsrc = 0,
+        uint8_t rtxPayloadType = 0
     );
 
     bool waitForCaptureFrame(
