@@ -35,10 +35,6 @@ static constexpr uint32_t PICKER_PREVIEW_FRAME_TIMEOUT_MS = 400;
 
 static void shutdown_engine_state()
 {
-    /*
-     * Watcher'Ä±n cleanup sÃ¼rerken yeni captureEnded eventi
-     * Ã¼retmesini Ã¶nce engelle.
-     */
     g_captureActive.store(
         false,
         std::memory_order_release
@@ -54,10 +50,6 @@ static void shutdown_engine_state()
         std::memory_order_release
     );
 
-    /*
-     * OBS ve RTP cleanup yalnÄ±zca service komut thread'inde
-     * gerÃ§ekleÅŸir. Watcher thread buraya girmez.
-     */
     if (g_engine) {
         g_engine->shutdown();
         g_engine.reset();
@@ -65,10 +57,6 @@ static void shutdown_engine_state()
 
     resetWgcTargetClosed();
 
-    /*
-     * Bir sonraki capture baÅŸlamadan Ã¶nce notification state'ini
-     * temiz bÄ±rak. Capture aktif olmadÄ±ÄŸÄ± iÃ§in watcher Ã§alÄ±ÅŸmaz.
-     */
     g_captureEndedNotified.store(
         false,
         std::memory_order_release
@@ -77,10 +65,6 @@ static void shutdown_engine_state()
 
 static void cleanup_active_capture_state()
 {
-    /*
-     * OBS context ve modÃ¼ller aÃ§Ä±k kalÄ±r.
-     * YalnÄ±zca aktif RTP/output/source nesneleri temizlenir.
-     */
     g_captureActive.store(
         false,
         std::memory_order_release
@@ -111,11 +95,6 @@ static void cleanup_active_capture_state()
 
 static void cleanup_preview_capture_state()
 {
-    /*
-     * Preview aktif bir gerÃ§ek yayÄ±n deÄŸildir.
-     * YalnÄ±zca geÃ§ici WGC scene/source temizlenir;
-     * OBS instance aÃ§Ä±k bÄ±rakÄ±lÄ±r.
-     */
     g_captureActive.store(
         false,
         std::memory_order_release
@@ -455,10 +434,6 @@ int runNativeService()
 								"\"type\":\"capturePreview\""
 						) != std::string::npos
 				) {
-						/*
-						* Preview ve gerÃ§ek yayÄ±n aynÄ± global OBS engine'i
-						* kullanÄ±yor. YayÄ±n aktifken preview baÅŸlatmÄ±yoruz.
-						*/
 						if (
 								g_captureActive.load(
 										std::memory_order_acquire
@@ -604,11 +579,6 @@ int runNativeService()
 								continue;
 						}
 
-						/*
-						* OBS video output'u preview iÃ§in kÃ¼Ã§Ã¼k tutuyoruz.
-						* WGC source kendi gerÃ§ek kaynak Ã§Ã¶zÃ¼nÃ¼rlÃ¼ÄŸÃ¼nÃ¼ yine
-						* ayrÄ± texture iÃ§inde Ã¼retir.
-						*/
 						ObsVideoConfig previewVideoConfig;
 
 						previewVideoConfig.outputWidth =
@@ -756,10 +726,6 @@ int runNativeService()
 								continue;
 						}
 
-						/*
-						* BÃ¼yÃ¼k ham BGRA frame'e artÄ±k ihtiyacÄ±mÄ±z yok.
-						* JSON hazÄ±rlanÄ±rken bellekte tutmayalÄ±m.
-						*/
 						sourcePixels.clear();
 						sourcePixels.shrink_to_fit();
 
@@ -829,10 +795,6 @@ int runNativeService()
 								<< pngBase64.size()
 								<< "\n";
 
-						/*
-						* Ã–nce capture/OBS kaynaklarÄ±nÄ± tamamen kapat.
-						* ArdÄ±ndan baÅŸarÄ± cevabÄ±nÄ± gÃ¶nder.
-						*/
 						cleanup_preview_capture_state();
 
 						std::string response =
@@ -930,6 +892,14 @@ int runNativeService()
 
 						uint32_t ssrc = static_cast<uint32_t>(
 								extract_uint_value(line, "ssrc", 0)
+						);
+
+						uint32_t rtxSsrc = static_cast<uint32_t>(
+								extract_uint_value(line, "rtxSsrc", 0)
+						);
+
+						uint8_t rtxPayloadType = static_cast<uint8_t>(
+								extract_uint_value(line, "rtxPayloadType", 0)
 						);
 
 						std::string audioRtpIp = extract_string_value(line, "audioRtpIp", "");
@@ -1219,7 +1189,9 @@ int runNativeService()
 												audioStreamingEnabled ? audioRtpIp : std::string{},
 												audioStreamingEnabled ? audioRtpPort : 0,
 												audioPayloadType,
-												audioStreamingEnabled ? audioSsrc : 0
+												audioStreamingEnabled ? audioSsrc : 0,
+												rtxSsrc,
+												rtxPayloadType
 								)) {
 										cleanup_active_capture_state();
 										send_json(
@@ -1354,6 +1326,15 @@ int runNativeService()
 						feedback.firCount = static_cast<uint32_t>(
 								extract_uint_value(line, "firCount", 0)
 						);
+
+						const std::string keyframeReason =
+								extract_string_value(line, "keyframeReason", "");
+
+						feedback.isNewSubscriberKeyframe =
+								keyframeReason == "new-subscriber";
+
+						feedback.keyframeRequested =
+								!keyframeReason.empty();
 
 						feedback.hasFeedback = true;
 
