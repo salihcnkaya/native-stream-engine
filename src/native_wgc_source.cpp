@@ -41,14 +41,6 @@ public:
                 &qualifier
             );
 
-        /*
-         * Thread zaten COM apartment iÃ§indeyse tekrar farklÄ± bir
-         * apartment modeli dayatmaya Ã§alÄ±ÅŸma.
-         *
-         * OBS veya baÅŸka bir Windows bileÅŸeni thread'i STA olarak
-         * hazÄ±rlamÄ±ÅŸ olabilir. Bu durumda MTA istemek
-         * RPC_E_CHANGED_MODE (0x80010106) Ã¼retir.
-         */
         if (SUCCEEDED(currentApartmentResult)) {
             return;
         }
@@ -91,10 +83,6 @@ private:
 
 static void ensureCurrentThreadComApartment()
 {
-    /*
-     * Her thread kendi guard'Ä±na sahip olur.
-     * Destructor da aynÄ± thread sona erdiÄŸinde Ã§alÄ±ÅŸÄ±r.
-     */
     thread_local ThreadComApartment apartment;
     (void)apartment;
 }
@@ -182,7 +170,18 @@ struct WgcSource {
     std::atomic<int> frameCount = 0;
     std::atomic<bool> targetClosed = false;
     std::atomic<bool> destroying = false;
+
+    std::atomic<int64_t> lastFrameArrivedAtMs{ 0 };
+    std::atomic<bool> stallActive{ false };
+    std::atomic<int64_t> stallStartedAtMs{ 0 };
 };
+
+static int64_t steadyNowMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()
+    ).count();
+}
 
 static bool isCaptureInactive(
     const WgcSource* ctx
@@ -224,10 +223,6 @@ static bool markCaptureTargetClosed(
             std::memory_order_acq_rel
         )
     ) {
-        /*
-         * BaÅŸka bir yol hedefi zaten kapalÄ± olarak iÅŸaretledi.
-         * AynÄ± logu ve cleanup davranÄ±ÅŸÄ±nÄ± tekrar Ã§alÄ±ÅŸtÄ±rma.
-         */
         return false;
     }
   
@@ -273,13 +268,6 @@ bool copyWgcFrameBgra(
     width = 0;
     height = 0;
 
-    /*
-     * Bu mutex yalnÄ±zca pointer'Ä± okumak iÃ§in deÄŸil,
-     * bÃ¼tÃ¼n kopyalama iÅŸlemi boyunca tutuluyor.
-     *
-     * BÃ¶ylece destroy fonksiyonu g_activeSource'u
-     * temizleyip ctx'yi delete edemez.
-     */
     std::lock_guard<std::mutex> activeSourceLock(
         g_activeSourceMutex
     );
@@ -937,9 +925,6 @@ static void resetSharedTextureLocked(
     WgcSource* ctx
 )
 {
-    /*
-     * Bu fonksiyon Ã§aÄŸrÄ±lÄ±rken sharedMutex kilitli olmalÄ±.
-     */
     destroyObsSharedTexture(ctx);
 
     ctx->sharedTexture = nullptr;
@@ -1158,10 +1143,6 @@ static void* wgc_create(obs_data_t*, obs_source_t*)
                                 contentHeight == ctx->framePoolHeight;
 
                             if (contentMatchesFramePool) {
-                                /*
-                                * Boyut tekrar mevcut frame pool boyutuna dÃ¶ndÃ¼yse
-                                * bekleyen resize iÅŸlemini iptal et.
-                                */
                                 ctx->framePoolResizePending = false;
                                 ctx->pendingFramePoolWidth = 0;
                                 ctx->pendingFramePoolHeight = 0;
@@ -1177,10 +1158,6 @@ static void* wgc_create(obs_data_t*, obs_source_t*)
                                         ctx->pendingFramePoolHeight;
 
                                 if (pendingSizeChanged) {
-                                    /*
-                                    * Yeni bir ara boyut gÃ¶rdÃ¼k.
-                                    * Debounce sÃ¼resini bu boyut iÃ§in yeniden baÅŸlat.
-                                    */
                                     ctx->pendingFramePoolWidth =
                                         contentWidth;
 
@@ -1214,11 +1191,6 @@ static void* wgc_create(obs_data_t*, obs_source_t*)
                         }
 
                         if (shouldRecreateFramePool) {
-                            /*
-                            * Resize iÃ§in kullandÄ±ÄŸÄ±mÄ±z frame eski frame-pool
-                            * texture boyutunda olabilir. Ã–nce frame'i bÄ±rak,
-                            * ardÄ±ndan frame pool'u yeni sabit boyutla oluÅŸtur.
-                            */
                             frame.Close();
 
                             std::lock_guard<std::mutex> poolLock(
@@ -1338,15 +1310,29 @@ static void* wgc_create(obs_data_t*, obs_source_t*)
                             texture.get()
                         );
 
+                        ctx->lastFrameArrivedAtMs.store(
+                            steadyNowMs(),
+                            std::memory_order_release
+                        );
+
+                        if (ctx->stallActive.load(std::memory_order_acquire)) {
+                            ctx->stallActive.store(false, std::memory_order_release);
+
+                            const int64_t stallDurationMs =
+                                steadyNowMs() -
+                                ctx->stallStartedAtMs.load(std::memory_order_acquire);
+
+                            std::cerr
+                                << "[Native WGC Source] capture stall RECOVERED"
+                                << " durationMs=" << stallDurationMs
+                                << "\n";
+                        }
+
                         const uint64_t activeGeneration =
                             g_activeSourceGeneration.load(
                                 std::memory_order_acquire
                             );
 
-                        /*
-                        * Eski bir source'un gecikmiÅŸ FrameArrived callback'i
-                        * yeni preview state'ini kirletemez.
-                        */
                         if (activeGeneration != ctx->generation) {
                             return;
                         }
@@ -1395,10 +1381,6 @@ static void* wgc_create(obs_data_t*, obs_source_t*)
                             << "\n";
                     }
 
-                    /*
-                    * Frame artÄ±k kullanÄ±lmÄ±yor. Recreate iÅŸlemini
-                    * frame kapandÄ±ktan sonra gerÃ§ekleÅŸtiriyoruz.
-                    */
                     frame.Close();
 
                 } catch (
@@ -1655,11 +1637,31 @@ static void wgc_video_render(void* data, gs_effect_t*)
         return;
     }
 
-
     std::lock_guard<std::mutex> lock(ctx->sharedMutex);
 
     if (!ctx->sharedHandle) {
         return;
+    }
+
+    static constexpr int64_t kStallThresholdMs = 500;
+
+    const int64_t lastFrameAt =
+        ctx->lastFrameArrivedAtMs.load(std::memory_order_acquire);
+
+    if (lastFrameAt != 0) {
+        const int64_t gapMs = steadyNowMs() - lastFrameAt;
+
+        if (gapMs >= kStallThresholdMs) {
+            if (!ctx->stallActive.load(std::memory_order_acquire)) {
+                ctx->stallActive.store(true, std::memory_order_release);
+                ctx->stallStartedAtMs.store(lastFrameAt, std::memory_order_release);
+
+                std::cerr
+                    << "[Native WGC Source] capture stall DETECTED"
+                    << " lastFrameAgeMs=" << gapMs
+                    << "\n";
+            }
+        }
     }
 
     if (!gs_shared_texture_available()) {
