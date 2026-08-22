@@ -1,0 +1,28 @@
+--- a/plugins/obs-nvenc/nvenc.c
++++ b/plugins/obs-nvenc/nvenc.c
+@@ -103,11 +103,23 @@
+ 		enc->config.rcParams.maxBitRate = vbr ? (uint32_t)enc->props.max_bitrate * 1000
+ 						      : (uint32_t)enc->props.bitrate * 1000;
+ 
++		/* native-stream-engine patch: allow a lightweight reconfigure
++		 * that does not reset internal NVENC session/rate-control
++		 * state. Stock OBS always sets resetEncoder=1 together with
++		 * forceIDR=1, which causes a visible encode-pipeline stall on
++		 * every keyframe request or adaptive-bitrate change. When
++		 * "__nse_lightweight" is set, resetEncoder is left at 0;
++		 * "__nse_force_idr_only" still forces an IDR on the next
++		 * frame without the reset. Unrecognized by unpatched OBS
++		 * builds, so safe to send unconditionally. */
++		const bool nse_lightweight = obs_data_get_bool(settings, "__nse_lightweight");
++		const bool nse_force_idr_only = obs_data_get_bool(settings, "__nse_force_idr_only");
++
+ 		NV_ENC_RECONFIGURE_PARAMS params = {0};
+ 		params.version = NV_ENC_RECONFIGURE_PARAMS_VER;
+ 		params.reInitEncodeParams = enc->params;
+-		params.resetEncoder = 1;
+-		params.forceIDR = 1;
++		params.resetEncoder = nse_lightweight ? 0 : 1;
++		params.forceIDR = nse_lightweight ? (nse_force_idr_only ? 1 : 0) : 1;
+ 
+ 		if (NV_FAILED(nv.nvEncReconfigureEncoder(enc->session, &params))) {
+ 			return false;
