@@ -6,8 +6,8 @@
 
 #pragma comment(lib, "Ws2_32.lib")
 
-static constexpr bool STREAM_DEBUG_RTP_STATS = true;
-static constexpr bool STREAM_DEBUG_RTCP_NACK = true;
+static constexpr bool STREAM_DEBUG_RTP_STATS = false;
+static constexpr bool STREAM_DEBUG_RTCP_NACK = false;
 static constexpr bool STREAM_DEBUG_RTCP_TWCC = false;
 
 RealtimeRtpSender::RealtimeRtpSender() = default;
