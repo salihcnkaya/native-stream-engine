@@ -11,6 +11,7 @@
 
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Metadata.h>
 #include <winrt/Windows.Graphics.h>
 #include <winrt/Windows.Graphics.Capture.h>
 #include <winrt/Windows.Graphics.DirectX.h>
@@ -26,6 +27,8 @@
 #include <iostream>
 #include <mutex>
 #include <objbase.h>
+#include <thread>
+#include <future>
 
 
 class ThreadComApartment {
@@ -161,7 +164,7 @@ struct WgcSource {
     winrt::event_token frameToken{};
     winrt::event_token itemClosedToken{};
 
-    std::mutex sharedMutex;
+    std::timed_mutex sharedMutex;
     std::mutex framePoolMutex;
     winrt::com_ptr<ID3D11Texture2D> sharedTexture;
     HANDLE sharedHandle = nullptr;
@@ -268,7 +271,7 @@ bool copyWgcFrameBgra(
     width = 0;
     height = 0;
 
-    std::lock_guard<std::mutex> activeSourceLock(
+    std::unique_lock<std::mutex> activeSourceLock(
         g_activeSourceMutex
     );
 
@@ -324,9 +327,10 @@ bool copyWgcFrameBgra(
         return false;
     }
 
-    std::lock_guard<std::mutex> sharedLock(
-        ctx->sharedMutex
-    );
+    auto sharedLock =
+        std::make_shared<std::unique_lock<std::timed_mutex>>(
+            ctx->sharedMutex
+        );
 
     if (
         !ctx->sharedTexture ||
@@ -393,139 +397,228 @@ bool copyWgcFrameBgra(
 
     stagingDesc.MiscFlags = 0;
 
-    winrt::com_ptr<ID3D11Texture2D>
-        stagingTexture;
+    constexpr auto kFrameCopyTimeout =
+        std::chrono::milliseconds(750);
 
-    HRESULT result =
-        ctx->d3d.device->CreateTexture2D(
-            &stagingDesc,
-            nullptr,
-            stagingTexture.put()
+    struct FrameCopyResult {
+        bool ok = false;
+        HRESULT hr = S_OK;
+        const char* failureReason = nullptr;
+        std::vector<uint8_t> pixels;
+        uint32_t width = 0;
+        uint32_t height = 0;
+    };
+
+    auto resultPromise =
+        std::make_shared<std::promise<FrameCopyResult>>();
+
+    std::future<FrameCopyResult> resultFuture =
+        resultPromise->get_future();
+
+    winrt::com_ptr<ID3D11Device> deviceCopy =
+        ctx->d3d.device;
+
+    winrt::com_ptr<ID3D11DeviceContext> contextCopy =
+        ctx->d3d.context;
+
+    winrt::com_ptr<ID3D11Texture2D> sharedTextureCopy =
+        ctx->sharedTexture;
+
+    activeSourceLock.unlock();
+
+    auto progressMarker =
+        std::make_shared<std::atomic<int>>(0);
+
+    std::thread worker(
+        [
+            sharedLock,
+            resultPromise,
+            progressMarker,
+            deviceCopy,
+            contextCopy,
+            sharedTextureCopy,
+            stagingDesc,
+            capturedWidth = sourceDesc.Width,
+            capturedHeight = sourceDesc.Height
+        ]() mutable {
+            FrameCopyResult out;
+            out.width = capturedWidth;
+            out.height = capturedHeight;
+
+            winrt::com_ptr<ID3D11Texture2D> stagingTexture;
+
+            progressMarker->store(1, std::memory_order_release);
+
+            out.hr =
+                deviceCopy->CreateTexture2D(
+                    &stagingDesc,
+                    nullptr,
+                    stagingTexture.put()
+                );
+
+            progressMarker->store(2, std::memory_order_release);
+
+            if (FAILED(out.hr)) {
+                out.failureReason =
+                    "create_staging_texture_failed";
+
+                resultPromise->set_value(std::move(out));
+
+                return;
+            }
+
+            progressMarker->store(3, std::memory_order_release);
+
+            contextCopy->CopyResource(
+                stagingTexture.get(),
+                sharedTextureCopy.get()
+            );
+
+            progressMarker->store(4, std::memory_order_release);
+
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+
+            progressMarker->store(5, std::memory_order_release);
+
+            out.hr =
+                contextCopy->Map(
+                    stagingTexture.get(),
+                    0,
+                    D3D11_MAP_READ,
+                    0,
+                    &mapped
+                );
+
+            progressMarker->store(6, std::memory_order_release);
+
+            if (FAILED(out.hr)) {
+                out.failureReason =
+                    "map_staging_texture_failed";
+
+                resultPromise->set_value(std::move(out));
+
+                return;
+            }
+
+            constexpr size_t bytesPerPixel = 4;
+
+            const size_t destinationRowBytes =
+                static_cast<size_t>(capturedWidth) *
+                bytesPerPixel;
+
+            const size_t destinationSize =
+                destinationRowBytes *
+                static_cast<size_t>(capturedHeight);
+
+            try {
+                out.pixels.resize(destinationSize);
+            } catch (...) {
+                out.failureReason =
+                    "pixel_buffer_allocation_failed";
+
+                resultPromise->set_value(std::move(out));
+
+                contextCopy->Unmap(
+                    stagingTexture.get(),
+                    0
+                );
+
+                return;
+            }
+
+            const auto* sourceBytes =
+                static_cast<const uint8_t*>(
+                    mapped.pData
+                );
+
+            for (
+                uint32_t row = 0;
+                row < capturedHeight;
+                ++row
+            ) {
+                const uint8_t* sourceRow =
+                    sourceBytes +
+                    static_cast<size_t>(row) *
+                    mapped.RowPitch;
+
+                uint8_t* destinationRow =
+                    out.pixels.data() +
+                    static_cast<size_t>(row) *
+                    destinationRowBytes;
+
+                std::memcpy(
+                    destinationRow,
+                    sourceRow,
+                    destinationRowBytes
+                );
+            }
+
+            progressMarker->store(7, std::memory_order_release);
+
+            out.ok = true;
+
+            resultPromise->set_value(std::move(out));
+
+            progressMarker->store(8, std::memory_order_release);
+
+            contextCopy->Unmap(
+                stagingTexture.get(),
+                0
+            );
+
+            progressMarker->store(9, std::memory_order_release);
+        }
+    );
+
+    const auto waitStatus =
+        resultFuture.wait_for(
+            kFrameCopyTimeout
         );
 
-    if (FAILED(result)) {
+    if (waitStatus != std::future_status::ready) {
+
+        worker.detach();
+
         std::cerr
             << "[Native WGC Source] "
             << "frame copy failed"
-            << " reason=create_staging_texture_failed"
+            << " reason=frame_copy_timed_out"
+            << " timeoutMs="
+            << kFrameCopyTimeout.count()
+            << " stuckAtStep="
+            << progressMarker->load(std::memory_order_acquire)
+            << " (1=CreateTexture2D_start 2=CreateTexture2D_done"
+            << " 3=CopyResource_start 4=CopyResource_done"
+            << " 5=Map_start 6=Map_done 7=memcpy_done"
+            << " 8=Unmap_start 9=Unmap_done)"
+            << "\n";
+
+        return false;
+    }
+
+    worker.detach();
+
+    FrameCopyResult result =
+        resultFuture.get();
+
+    if (!result.ok) {
+        std::cerr
+            << "[Native WGC Source] "
+            << "frame copy failed"
+            << " reason="
+            << (result.failureReason ? result.failureReason : "unknown")
             << " hr=0x"
             << std::hex
-            << static_cast<uint32_t>(
-                result
-            )
+            << static_cast<uint32_t>(result.hr)
             << std::dec
             << "\n";
 
         return false;
     }
 
-    ctx->d3d.context->CopyResource(
-        stagingTexture.get(),
-        ctx->sharedTexture.get()
-    );
-
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-
-    result =
-        ctx->d3d.context->Map(
-            stagingTexture.get(),
-            0,
-            D3D11_MAP_READ,
-            0,
-            &mapped
-        );
-
-    if (FAILED(result)) {
-        std::cerr
-            << "[Native WGC Source] "
-            << "frame copy failed"
-            << " reason=map_staging_texture_failed"
-            << " hr=0x"
-            << std::hex
-            << static_cast<uint32_t>(
-                result
-            )
-            << std::dec
-            << "\n";
-
-        return false;
-    }
-
-    const uint32_t capturedWidth =
-        sourceDesc.Width;
-
-    const uint32_t capturedHeight =
-        sourceDesc.Height;
-
-    constexpr size_t bytesPerPixel = 4;
-
-    const size_t destinationRowBytes =
-        static_cast<size_t>(
-            capturedWidth
-        ) *
-        bytesPerPixel;
-
-    const size_t destinationSize =
-        destinationRowBytes *
-        static_cast<size_t>(
-            capturedHeight
-        );
-
-    try {
-        pixels.resize(
-            destinationSize
-        );
-    } catch (...) {
-        ctx->d3d.context->Unmap(
-            stagingTexture.get(),
-            0
-        );
-
-        pixels.clear();
-
-        std::cerr
-            << "[Native WGC Source] "
-            << "frame copy failed"
-            << " reason=pixel_buffer_allocation_failed"
-            << "\n";
-
-        return false;
-    }
-
-    const auto* sourceBytes =
-        static_cast<const uint8_t*>(
-            mapped.pData
-        );
-
-    for (
-        uint32_t row = 0;
-        row < capturedHeight;
-        ++row
-    ) {
-        const uint8_t* sourceRow =
-            sourceBytes +
-            static_cast<size_t>(row) *
-            mapped.RowPitch;
-
-        uint8_t* destinationRow =
-            pixels.data() +
-            static_cast<size_t>(row) *
-            destinationRowBytes;
-
-        std::memcpy(
-            destinationRow,
-            sourceRow,
-            destinationRowBytes
-        );
-    }
-
-    ctx->d3d.context->Unmap(
-        stagingTexture.get(),
-        0
-    );
-
-    width = capturedWidth;
-    height = capturedHeight;
+    pixels = std::move(result.pixels);
+    width = result.width;
+    height = result.height;
 
     std::cerr
         << "[Native WGC Source] "
@@ -633,6 +726,23 @@ static bool requestBorderlessCaptureAccess()
     }
 
     g_borderlessAccessRequested.store(true, std::memory_order_release);
+
+    const bool apiAvailable =
+        winrt::Windows::Foundation::Metadata::ApiInformation::IsMethodPresent(
+            L"Windows.Graphics.Capture.GraphicsCaptureAccess",
+            L"RequestAccessAsync"
+        );
+
+    if (!apiAvailable) {
+        g_borderlessAccessGranted.store(false, std::memory_order_release);
+
+        std::cerr
+            << "[Native WGC Source] borderless capture API not present on "
+            << "this Windows version (requires 10.0.20348.0+, effectively "
+            << "Windows 11) - skipping, will use bordered capture\n";
+
+        return false;
+    }
 
     try {
         const auto status =
@@ -1260,7 +1370,7 @@ static void* wgc_create(obs_data_t*, obs_source_t*)
                     bool sizeChanged = false;
 
                     {
-                        std::lock_guard<std::mutex> lock(
+                        std::lock_guard<std::timed_mutex> lock(
                             ctx->sharedMutex
                         );
 
@@ -1443,17 +1553,25 @@ static void* wgc_create(obs_data_t*, obs_source_t*)
 
 static void wgc_destroy(void* data)
 {
+    std::cerr << "[Native Stream DIAG] wgc_destroy CALLED\n";
+
     auto* ctx =
         static_cast<WgcSource*>(data);
 
     if (!ctx) {
+        std::cerr << "[Native Stream DIAG] wgc_destroy: ctx is null, returning\n";
+
         return;
     }
+
+    std::cerr << "[Native Stream DIAG] wgc_destroy: acquiring g_activeSourceMutex\n";
 
     {
         std::lock_guard<std::mutex> lock(
             g_activeSourceMutex
         );
+
+        std::cerr << "[Native Stream DIAG] wgc_destroy: g_activeSourceMutex acquired\n";
 
         if (g_activeSource == ctx) {
             g_activeSource = nullptr;
@@ -1477,58 +1595,137 @@ static void wgc_destroy(void* data)
         << ctx->frameCount.load()
         << "\n";
 
-    try {
-        if (ctx->item) {
-            ctx->item.Closed(
-                ctx->itemClosedToken
-            );
-        }
-    } catch (...) {
-    }
+    std::cerr << "[Native Stream DIAG] wgc_destroy: before starting closeWorker\n";
 
-    try {
-        std::lock_guard<std::mutex> poolLock(
+    auto itemCopy = ctx->item;
+    auto itemClosedTokenCopy = ctx->itemClosedToken;
+    auto sessionCopy = ctx->session;
+    auto framePoolCopy = ctx->framePool;
+    auto frameTokenCopy = ctx->frameToken;
+
+    auto poolLock =
+        std::make_shared<std::unique_lock<std::mutex>>(
             ctx->framePoolMutex
         );
 
-        if (ctx->framePool) {
-            ctx->framePool.FrameArrived(
-                ctx->frameToken
-            );
-        }
+    auto closePromise =
+        std::make_shared<std::promise<void>>();
 
-        if (ctx->session) {
-            ctx->session.Close();
-            ctx->session = nullptr;
-        }
+    std::future<void> closeFuture =
+        closePromise->get_future();
 
-        if (ctx->framePool) {
-            ctx->framePool.Close();
-            ctx->framePool = nullptr;
-        }
-    } catch (
-        const winrt::hresult_error& error
-    ) {
-        std::wcerr
-            << L"[Native WGC Source] cleanup warning"
-            << L" message="
-            << error.message().c_str()
-            << L" hr=0x"
-            << std::hex
-            << static_cast<uint32_t>(
-                error.code()
-            )
-            << std::dec
-            << L"\n";
-    } catch (...) {
-    }
+    std::thread closeWorker(
+        [
+            closePromise,
+            poolLock,
+            itemCopy,
+            itemClosedTokenCopy,
+            sessionCopy,
+            framePoolCopy,
+            frameTokenCopy
+        ]() mutable {
+            std::cerr << "[Native Stream DIAG] closeWorker: thread started\n";
 
-    {
-        std::lock_guard<std::mutex> lock(
-            ctx->sharedMutex
+            try {
+                if (itemCopy) {
+                    itemCopy.Closed(
+                        itemClosedTokenCopy
+                    );
+                }
+            } catch (...) {
+            }
+
+            std::cerr << "[Native Stream DIAG] closeWorker: item.Closed done\n";
+
+            try {
+                if (framePoolCopy) {
+                    framePoolCopy.FrameArrived(
+                        frameTokenCopy
+                    );
+                }
+            } catch (...) {
+            }
+
+            std::cerr << "[Native Stream DIAG] closeWorker: framePool.FrameArrived (unsubscribe) done\n";
+
+            try {
+                if (sessionCopy) {
+                    sessionCopy.Close();
+                }
+            } catch (...) {
+            }
+
+            std::cerr << "[Native Stream DIAG] closeWorker: session.Close done\n";
+
+            try {
+                if (framePoolCopy) {
+                    framePoolCopy.Close();
+                }
+            } catch (...) {
+            }
+
+            std::cerr << "[Native Stream DIAG] closeWorker: framePool.Close done, thread finishing\n";
+
+            closePromise->set_value();
+        }
+    );
+
+    std::cerr << "[Native Stream DIAG] wgc_destroy: closeWorker started, waiting\n";
+
+    constexpr auto kCloseTimeout =
+        std::chrono::milliseconds(750);
+
+    const auto closeStatus =
+        closeFuture.wait_for(
+            kCloseTimeout
         );
 
-        resetSharedTextureLocked(ctx);
+    if (closeStatus == std::future_status::ready) {
+        std::cerr << "[Native Stream DIAG] wgc_destroy: closeWorker finished in time, joining\n";
+
+        closeWorker.join();
+    } else {
+        closeWorker.detach();
+
+        std::cerr
+            << "[Native WGC Source] "
+            << "destroy: session/framePool close timed out"
+            << " timeoutMs="
+            << kCloseTimeout.count()
+            << " - continuing cleanup anyway (worker holds its own"
+            << " copies, ctx itself is not referenced by it)\n";
+    }
+
+    ctx->session = nullptr;
+    ctx->framePool = nullptr;
+
+    std::cerr << "[Native Stream DIAG] wgc_destroy: about to acquire sharedMutex (timed)\n";
+
+    bool sharedTextureCleaned = false;
+
+    {
+        std::unique_lock<std::timed_mutex> lock(
+            ctx->sharedMutex,
+            std::defer_lock
+        );
+
+        if (lock.try_lock_for(std::chrono::milliseconds(500))) {
+            resetSharedTextureLocked(ctx);
+            sharedTextureCleaned = true;
+        } else {
+            std::cerr
+                << "[Native WGC Source] "
+                << "destroy: sharedMutex busy (worker thread likely "
+                << "still stuck on a driver call) - leaking this "
+                << "source intentionally instead of risking a "
+                << "use-after-free\n";
+        }
+    }
+
+    if (!sharedTextureCleaned) {
+        std::cerr << "[Native Stream DIAG] wgc_destroy: returning early (sharedTexture not cleaned, ctx leaked intentionally)\n";
+
+        return;
     }
 
     ctx->item = nullptr;
@@ -1537,6 +1734,8 @@ static void wgc_destroy(void* data)
     ctx->d3d.device = nullptr;
 
     delete ctx;
+
+    std::cerr << "[Native Stream DIAG] wgc_destroy COMPLETED\n";
 }
 
 
@@ -1637,7 +1836,7 @@ static void wgc_video_render(void* data, gs_effect_t*)
         return;
     }
 
-    std::lock_guard<std::mutex> lock(ctx->sharedMutex);
+    std::lock_guard<std::timed_mutex> lock(ctx->sharedMutex);
 
     if (!ctx->sharedHandle) {
         return;
