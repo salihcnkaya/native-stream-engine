@@ -2,10 +2,13 @@
 
 #include <obs.h>
 #include <cstring>
+#include <cstdlib>
+#include <atomic>
 #include <iostream>
 #include <algorithm>
 #include <thread>
 #include <chrono>
+#include <future>
 #include "window_utils.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -24,6 +27,9 @@ namespace fs = std::filesystem;
 static obs_scene_t* g_scene = nullptr;
 static obs_sceneitem_t* g_captureSceneItem = nullptr;
 static obs_source_t* g_captureSource = nullptr;
+
+static std::atomic<bool> g_obsOutputStateUnstable{ false };
+
 
 static obs_source_t* g_audioSource = nullptr;
 static obs_encoder_t* g_rtpVideoEncoder = nullptr;
@@ -186,7 +192,8 @@ static size_t findStartCode(const uint8_t* data, size_t size, size_t offset)
 bool ObsEngine::waitForCaptureFrame(
     int timeoutMs,
     uint32_t& width,
-    uint32_t& height
+    uint32_t& height,
+    const std::atomic<bool>* cancelFlag
 ) const
 {
     width = 0;
@@ -205,6 +212,18 @@ bool ObsEngine::waitForCaptureFrame(
         );
 
     while (true) {
+        if (
+            cancelFlag &&
+            cancelFlag->load(std::memory_order_acquire)
+        ) {
+            std::cerr
+                << "[Native Stream Engine] "
+                << "capture frame wait aborted"
+                << " reason=cancelled\n";
+
+            return false;
+        }
+
         if (isWgcTargetClosed()) {
             std::cerr
                 << "[Native Stream Engine] "
@@ -591,10 +610,55 @@ bool ObsEngine::createWgcScene(
     g_captureSceneItem = item;
     g_captureSource = wgcSource;
 
-    obs_set_output_source(
-        0,
-        obs_scene_get_source(scene)
+    auto attachSourcePromise =
+        std::make_shared<std::promise<void>>();
+
+    std::future<void> attachSourceFuture =
+        attachSourcePromise->get_future();
+
+    obs_source_t* sceneSourceForAttach =
+        obs_scene_get_source(scene);
+
+    std::thread attachSourceWorker(
+        [attachSourcePromise, sceneSourceForAttach]() {
+            obs_set_output_source(
+                0,
+                sceneSourceForAttach
+            );
+
+            attachSourcePromise->set_value();
+        }
     );
+
+    constexpr auto kAttachSourceTimeout =
+        std::chrono::milliseconds(750);
+
+    const auto attachSourceStatus =
+        attachSourceFuture.wait_for(
+            kAttachSourceTimeout
+        );
+
+    if (attachSourceStatus == std::future_status::ready) {
+        attachSourceWorker.join();
+    } else {
+        attachSourceWorker.detach();
+
+        g_obsOutputStateUnstable.store(
+            true,
+            std::memory_order_release
+        );
+
+        std::cerr
+            << "[Native Stream Engine] "
+            << "createWgcScene: obs_set_output_source timed out"
+            << " timeoutMs="
+            << kAttachSourceTimeout.count()
+            << " - treating this capture attempt as failed so the"
+            << " caller can report an error and move on to the next"
+            << " window/monitor\n";
+
+        return false;
+    }
 
     return true;
 }
@@ -2093,59 +2157,129 @@ void ObsEngine::updateNetworkFeedback(
 
 void ObsEngine::clearCapture()
 {
+    std::cerr << "[Native Stream DIAG] clearCapture() CALLED\n";
+
     if (captureCleared_) {
+        std::cerr << "[Native Stream DIAG] clearCapture: already cleared, returning early\n";
+
         return;
     }
 
     captureCleared_ = true;
 
-    obs_set_output_source(
-        0,
-        nullptr
+    obs_source_t* audioSourceToRelease = g_audioSource;
+    obs_sceneitem_t* sceneItemToRemove = g_captureSceneItem;
+    obs_source_t* captureSourceToRelease = g_captureSource;
+    obs_scene_t* sceneToRelease = g_scene;
+
+    auto cleanupPromise =
+        std::make_shared<std::promise<void>>();
+
+    std::future<void> cleanupFuture =
+        cleanupPromise->get_future();
+
+    std::thread cleanupWorker(
+        [
+            cleanupPromise,
+            audioSourceToRelease,
+            sceneItemToRemove,
+            captureSourceToRelease,
+            sceneToRelease
+        ]() {
+            std::cerr << "[Native Stream DIAG] cleanupWorker: thread started\n";
+
+            obs_set_output_source(
+                0,
+                nullptr
+            );
+
+            std::cerr << "[Native Stream DIAG] cleanupWorker: obs_set_output_source(0) done\n";
+
+            obs_set_output_source(
+                1,
+                nullptr
+            );
+
+            std::cerr << "[Native Stream DIAG] cleanupWorker: obs_set_output_source(1) done\n";
+
+            if (audioSourceToRelease) {
+                obs_source_release(
+                    audioSourceToRelease
+                );
+
+                std::cerr << "[Native Stream DIAG] cleanupWorker: audio source released\n";
+            }
+
+            if (sceneItemToRemove) {
+                obs_sceneitem_remove(
+                    sceneItemToRemove
+                );
+
+                std::cerr << "[Native Stream DIAG] cleanupWorker: scene item removed\n";
+            }
+
+            if (captureSourceToRelease) {
+                obs_source_release(
+                    captureSourceToRelease
+                );
+
+                std::cerr << "[Native Stream DIAG] cleanupWorker: capture source released (triggers wgc_destroy synchronously)\n";
+            }
+
+            if (sceneToRelease) {
+                obs_scene_release(
+                    sceneToRelease
+                );
+
+                std::cerr << "[Native Stream DIAG] cleanupWorker: scene released\n";
+            }
+
+            std::cerr << "[Native Stream DIAG] cleanupWorker: all steps done, thread finishing\n";
+
+            cleanupPromise->set_value();
+        }
     );
 
-    obs_set_output_source(
-        1,
-        nullptr
-    );
+    constexpr auto kCleanupTimeout =
+        std::chrono::milliseconds(3000);
 
-    if (g_audioSource) {
-        obs_source_release(
-            g_audioSource
+    const auto cleanupStatus =
+        cleanupFuture.wait_for(
+            kCleanupTimeout
         );
+
+    if (cleanupStatus == std::future_status::ready) {
+        cleanupWorker.join();
 
         g_audioSource = nullptr;
-    }
-
-    if (g_captureSceneItem) {
-        obs_sceneitem_remove(
-            g_captureSceneItem
-        );
-
         g_captureSceneItem = nullptr;
-    }
-
-    if (g_captureSource) {
-        obs_source_release(
-            g_captureSource
-        );
-
         g_captureSource = nullptr;
-    }
+        g_scene = nullptr;
 
-    if (g_scene) {
-        obs_scene_release(
-            g_scene
+        resetWgcFrameState();
+
+        std::cerr
+            << "[Native Stream Engine] "
+            << "capture resources cleared\n";
+    } else {
+        cleanupWorker.detach();
+
+        g_obsOutputStateUnstable.store(
+            true,
+            std::memory_order_release
         );
 
-        g_scene = nullptr;
-    }
+        std::cerr
+            << "[Native Stream Engine] "
+            << "clearCapture: cleanup timed out"
+            << " timeoutMs="
+            << kCleanupTimeout.count()
+            << " - leaving ALL capture resources uncleaned (worker"
+            << " still running in background); OBS state marked"
+            << " unstable for a safe shutdown later\n";
 
-    resetWgcFrameState();
-    
-    std::cerr
-        << "[Native Stream Engine] "
-        << "capture resources cleared\n";
+        resetWgcFrameState();
+    }
 }
 
 void ObsEngine::shutdown()
@@ -2158,5 +2292,23 @@ void ObsEngine::shutdown()
 
     stopRtpStreaming();
     clearCapture();
+
+    if (
+        g_obsOutputStateUnstable.load(
+            std::memory_order_acquire
+        )
+    ) {
+        std::cerr
+            << "[Native Stream Engine] "
+            << "shutdown: OBS output state is unstable (a prior"
+            << " obs_set_output_source call never returned) - skipping"
+            << " obs_shutdown() to avoid racing with the still-running"
+            << " detached thread, terminating process directly instead\n";
+
+        std::cerr.flush();
+
+        std::_Exit(1);
+    }
+
     obs_shutdown();
 }

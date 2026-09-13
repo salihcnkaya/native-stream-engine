@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#include <atomic>
 
 #include "native_wgc_source.h"
 #include "bitrate_update_scheduler.h"
@@ -71,7 +72,8 @@ public:
     bool waitForCaptureFrame(
         int timeoutMs,
         uint32_t& width,
-        uint32_t& height
+        uint32_t& height,
+        const std::atomic<bool>* cancelFlag = nullptr
     ) const;
 
     void stopRtpStreaming();
