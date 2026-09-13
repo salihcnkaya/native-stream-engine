@@ -90,10 +90,6 @@ bool resizeBgraFrame(
         return false;
     }
 
-    /*
-     * KaynaÄŸÄ± maxWidth x maxHeight sÄ±nÄ±rlarÄ±nÄ±n iÃ§ine
-     * en-boy oranÄ±nÄ± bozmadan sÄ±ÄŸdÄ±rÄ±yoruz.
-     */
     const uint64_t widthComparison =
         static_cast<uint64_t>(sourceWidth) *
         static_cast<uint64_t>(maxHeight);

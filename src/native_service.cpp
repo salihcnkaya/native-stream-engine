@@ -26,6 +26,8 @@ static std::unique_ptr<ObsEngine> g_engine;
 static std::atomic<bool> g_captureActive = false;
 static std::atomic<bool> g_captureStarting = false;
 
+static std::atomic<bool> g_cancelRequested = false;
+
 static std::atomic<bool> g_serviceRunning = false;
 static std::atomic<bool> g_captureEndedNotified = false;
 
@@ -95,6 +97,8 @@ static void cleanup_active_capture_state()
 
 static void cleanup_preview_capture_state()
 {
+    std::cerr << "[Native Stream DIAG] cleanup_preview_capture_state() CALLED\n";
+
     g_captureActive.store(
         false,
         std::memory_order_release
@@ -111,7 +115,13 @@ static void cleanup_preview_capture_state()
     );
 
     if (g_engine) {
+        std::cerr << "[Native Stream DIAG] cleanup_preview_capture_state: before g_engine->clearCapture()\n";
+
         g_engine->clearCapture();
+
+        std::cerr << "[Native Stream DIAG] cleanup_preview_capture_state: after g_engine->clearCapture()\n";
+    } else {
+        std::cerr << "[Native Stream DIAG] cleanup_preview_capture_state: g_engine is null, skipping clearCapture\n";
     }
 
     resetWgcTargetClosed();
@@ -120,6 +130,8 @@ static void cleanup_preview_capture_state()
         false,
         std::memory_order_release
     );
+
+    std::cerr << "[Native Stream DIAG] cleanup_preview_capture_state() COMPLETED\n";
 }
 
 static constexpr bool STREAM_DEBUG_NETWORK_FEEDBACK = false;
@@ -277,12 +289,28 @@ static bool wait_for_valid_capture_size(
     int maxWaitMs,
     int intervalMs,
     int& outWidth,
-    int& outHeight
+    int& outHeight,
+    const std::atomic<bool>* cancelFlag = nullptr
 )
 {
     int elapsedMs = 0;
 
     while (elapsedMs <= maxWaitMs) {
+        if (
+            cancelFlag &&
+            cancelFlag->load(std::memory_order_acquire)
+        ) {
+            std::cerr << "[Native Stream Service] capture size wait cancelled\n";
+
+            return false;
+        }
+
+        if (!IsWindow(reinterpret_cast<HWND>(hwnd))) {
+            std::cerr << "[Native Stream Service] capture size wait aborted: window no longer exists\n";
+
+            return false;
+        }
+
         int width = 0;
         int height = 0;
 
@@ -374,6 +402,14 @@ int runNativeService()
 
     while (std::getline(std::cin, line)) {
 				int id = extract_id(line);
+
+				std::cerr
+						<< "[Native Stream DIAG] main loop: received line, id="
+						<< id
+						<< " lineLength=" << line.size()
+						<< " preview=" << line.substr(0, 80)
+						<< "\n";
+
         if (line.find("\"type\":\"ping\"") != std::string::npos) {
             send_json(
 								"{\"id\":" + std::to_string(id) + ",\"ok\":true,\"type\":\"pong\"}"
@@ -797,6 +833,8 @@ int runNativeService()
 
 						cleanup_preview_capture_state();
 
+						std::cerr << "[Native Stream DIAG] capturePreview: cleanup done, building response\n";
+
 						std::string response =
 								"{\"id\":" +
 								std::to_string(id) +
@@ -846,7 +884,14 @@ int runNativeService()
 								pngBase64 +
 								"\"}";
 
+						std::cerr
+								<< "[Native Stream DIAG] capturePreview: response built,"
+								<< " responseLength=" << response.size()
+								<< " - calling send_json\n";
+
 						send_json(response);
+
+						std::cerr << "[Native Stream DIAG] capturePreview: send_json returned, continuing loop\n";
 
 						continue;
 				}
@@ -869,6 +914,11 @@ int runNativeService()
 						);
 
 						g_captureEndedNotified.store(
+								false,
+								std::memory_order_release
+						);
+
+						g_cancelRequested.store(
 								false,
 								std::memory_order_release
 						);
@@ -972,261 +1022,359 @@ int runNativeService()
 								continue;
 						}
 
+						std::thread(
+								[
+										id,
+										capture,
+										monitorIndex,
+										audio,
+										quality,
+										rtpIp,
+										encoder,
+										rtpPort,
+										payloadType,
+										ssrc,
+										rtxSsrc,
+										rtxPayloadType,
+										audioRtpIp,
+										audioRtpPort,
+										audioPayloadType,
+										audioSsrc,
+										audioRtpEnabled,
+										rtpEnabled,
+										hwnd,
+										captureType
+								]() {
+										ObsVideoConfig videoConfig;
+										videoConfig.baseWidth = 1920;
+										videoConfig.baseHeight = 1080;
+										videoConfig.outputWidth = 1280;
+										videoConfig.outputHeight = 720;
+										videoConfig.fps = 60;
+										videoConfig.scaleFilter = "lanczos";
 
-						ObsVideoConfig videoConfig;
-						videoConfig.baseWidth = 1920;
-						videoConfig.baseHeight = 1080;
-						videoConfig.outputWidth = 1280;
-						videoConfig.outputHeight = 720;
-						videoConfig.fps = 60;
-						videoConfig.scaleFilter = "lanczos";
+										if (captureType != CaptureType::Monitor && hwnd != 0) {
+												int detectedWidth = 0;
+												int detectedHeight = 0;
 
+												if (!wait_for_valid_capture_size(
+																hwnd,
+																1800000, // 30 dakika - Discord modeli: kullanicinin uygulamaya donmesini genis bir pencerede bekle
+																750,
+																detectedWidth,
+																detectedHeight,
+																&g_cancelRequested
+														)) {
+														const bool wasCancelled =
+																g_cancelRequested.load(
+																		std::memory_order_acquire
+																);
 
-						if (captureType != CaptureType::Monitor && hwnd != 0) {
-								int detectedWidth = 0;
-								int detectedHeight = 0;
+														cleanup_active_capture_state();
 
-								if (!wait_for_valid_capture_size(
-												hwnd,
-												15000,
-												750,
-												detectedWidth,
-												detectedHeight
-										)) {
+														send_json(
+																"{\"id\":" + std::to_string(id) +
+																",\"ok\":false,\"type\":\"captureStartResult\","
+																"\"error\":\"" +
+																(wasCancelled
+																		? "cancelled"
+																		: "capture target did not become active in time") +
+																"\"}"
+														);
+
+														return;
+												}
+
+												videoConfig.baseWidth = detectedWidth;
+												videoConfig.baseHeight = detectedHeight;
+
+												std::cerr << "[Native Stream Service] detected capture size: "
+																	<< detectedWidth << "x" << detectedHeight << "\n";
+										}						
+
+										if (quality == "720p30") {
+												videoConfig.outputWidth = 1280;
+												videoConfig.outputHeight = 720;
+												videoConfig.fps = 30;
+										} else if (quality == "720p60") {
+												videoConfig.outputWidth = 1280;
+												videoConfig.outputHeight = 720;
+												videoConfig.fps = 60;
+										} else if (quality == "1080p30") {
+												videoConfig.outputWidth = 1920;
+												videoConfig.outputHeight = 1080;
+												videoConfig.fps = 30;
+										} else if (quality == "1080p60") {
+												videoConfig.outputWidth = 1920;
+												videoConfig.outputHeight = 1080;
+												videoConfig.fps = 60;
+										} else if (quality == "source") {
+												videoConfig.outputWidth = videoConfig.baseWidth;
+												videoConfig.outputHeight = videoConfig.baseHeight;
+												videoConfig.fps = 60;
+										} else {
+												std::cerr << "[Native Stream Service] unknown quality, falling back to 720p60: "
+																	<< quality
+																	<< "\n";
+										}
+
+										if (
+												g_cancelRequested.load(
+														std::memory_order_acquire
+												)
+										) {
+												cleanup_active_capture_state();
+
+												send_json(
+														"{\"id\":" + std::to_string(id) +
+														",\"ok\":false,\"type\":\"captureStartResult\","
+														"\"error\":\"cancelled\"}"
+												);
+
+												return;
+										}
+
+										if (!g_engine) {
+												g_engine =
+														std::make_unique<ObsEngine>();
+
+												if (
+														!g_engine->initialize(
+																get_runtime_dir(),
+																videoConfig
+														)
+												) {
+														shutdown_engine_state();
+
+														send_json(
+																"{\"id\":" +
+																std::to_string(id) +
+																",\"ok\":false,\"type\":\"captureStartResult\","
+																"\"error\":\"OBS initialize failed\"}"
+														);
+
+														return;
+												}
+										} else {
+												if (
+														!g_engine->configureVideo(
+																videoConfig
+														)
+												) {
+														shutdown_engine_state();
+
+														send_json(
+																"{\"id\":" +
+																std::to_string(id) +
+																",\"ok\":false,\"type\":\"captureStartResult\","
+																"\"error\":\"OBS video configure failed\"}"
+														);
+
+														return;
+												}
+										}
+
+										if (!g_engine->createCaptureScene(
+														captureType,
+														hwnd,
+														1000,
+														false,
+														monitorIndex
+												)) {
+
+												cleanup_active_capture_state();
+												send_json(
+														"{\"id\":" + std::to_string(id) +
+														",\"ok\":false,\"type\":\"captureStartResult\","
+														"\"error\":\"create capture scene failed\"}"
+												);
+												return;
+										}
+
+										uint32_t captureFrameWidth = 0;
+										uint32_t captureFrameHeight = 0;
+
+										if (
+												!g_engine->waitForCaptureFrame(
+														3000,
+														captureFrameWidth,
+														captureFrameHeight,
+														&g_cancelRequested
+												)
+										) {
+												const bool wasCancelled =
+														g_cancelRequested.load(
+																std::memory_order_acquire
+														);
+
+												cleanup_active_capture_state();
+												send_json(
+														"{\"id\":" +
+														std::to_string(id) +
+														",\"ok\":false,\"type\":\"captureStartResult\","
+														"\"error\":\"" +
+														(wasCancelled
+																? "cancelled"
+																: "capture frame unavailable") +
+														"\"}"
+												);
+
+												return;
+										}
+
+										std::cerr
+												<< "[Native Stream Service] "
+												<< "first capture frame confirmed "
+												<< captureFrameWidth
+												<< "x"
+												<< captureFrameHeight
+												<< "\n";
+
+										const bool audioStreamingEnabled =
+														audioRtpEnabled &&
+														audio != "none";
+
+										bool audioOk = true;
+
+										if (!audioStreamingEnabled) {
+														std::cerr
+																		<< "[Native Stream Service] "
+																		<< "audio capture disabled\n";
+										} else if (audio == "desktop") {
+														audioOk =
+																		g_engine->createDesktopAudioSource();
+										} else if (audio == "process") {
+														audioOk =
+																		g_engine->createProcessAudioSource(hwnd);
+										} else {
+														if (captureType == CaptureType::Monitor) {
+																audioOk =
+																				g_engine->createDesktopAudioSource();
+														} else {
+																audioOk =
+																				g_engine->createProcessAudioSource(hwnd);
+
+																if (!audioOk) {
+																				audioOk =
+																								g_engine->createDesktopAudioSource();
+																}
+														}
+										}
+
+										if (!audioOk) {
+												cleanup_active_capture_state();
+												send_json(
+														"{\"id\":" + std::to_string(id) +
+														",\"ok\":false,\"type\":\"captureStartResult\","
+														"\"error\":\"create audio source failed\"}"
+												);
+												return;
+										}
+
+										if (
+												g_cancelRequested.load(
+														std::memory_order_acquire
+												)
+										) {
+												cleanup_active_capture_state();
+
+												send_json(
+														"{\"id\":" + std::to_string(id) +
+														",\"ok\":false,\"type\":\"captureStartResult\","
+														"\"error\":\"cancelled\"}"
+												);
+
+												return;
+										}
+
+										if (rtpEnabled) {
+												int bitrate = 6000;
+
+												if (quality == "720p30") {
+														bitrate = 2500;
+												} else if (quality == "720p60") {
+														bitrate = 4500;
+												} else if (quality == "1080p30") {
+														bitrate = 5500;
+												} else if (quality == "1080p60" || quality == "source") {
+														bitrate = 8000;
+												} else {
+														bitrate = 4500;
+												}
+
+												if (!g_engine->startRtpStreaming(
+																rtpIp,
+																rtpPort,
+																payloadType,
+																ssrc,
+																bitrate,
+																encoder,
+																audioStreamingEnabled ? audioRtpIp : std::string{},
+																audioStreamingEnabled ? audioRtpPort : 0,
+																audioPayloadType,
+																audioStreamingEnabled ? audioSsrc : 0,
+																rtxSsrc,
+																rtxPayloadType
+												)) {
+														cleanup_active_capture_state();
+														send_json(
+																"{\"id\":" + std::to_string(id) +
+																",\"ok\":false,\"type\":\"captureStartResult\","
+																"\"error\":\"start RTP streaming failed\"}"
+														);
+
+														return;
+												}
+										}								
+
+										g_captureActive.store(
+												true,
+												std::memory_order_release
+										);
+
 										g_captureStarting.store(
 												false,
 												std::memory_order_release
 										);
-										
+
+										g_captureEndedNotified.store(
+												false,
+												std::memory_order_release
+										);
+
 										send_json(
 												"{\"id\":" + std::to_string(id) +
-												",\"ok\":false,\"error\":\"capture target did not become active in time\"}"
+												",\"ok\":true,\"type\":\"captureStartResult\"}"
 										);
-
-										continue;
 								}
-
-								videoConfig.baseWidth = detectedWidth;
-								videoConfig.baseHeight = detectedHeight;
-
-								std::cerr << "[Native Stream Service] detected capture size: "
-													<< detectedWidth << "x" << detectedHeight << "\n";
-						}						
-
-						if (quality == "720p30") {
-								videoConfig.outputWidth = 1280;
-								videoConfig.outputHeight = 720;
-								videoConfig.fps = 30;
-						} else if (quality == "720p60") {
-								videoConfig.outputWidth = 1280;
-								videoConfig.outputHeight = 720;
-								videoConfig.fps = 60;
-						} else if (quality == "1080p30") {
-								videoConfig.outputWidth = 1920;
-								videoConfig.outputHeight = 1080;
-								videoConfig.fps = 30;
-						} else if (quality == "1080p60") {
-								videoConfig.outputWidth = 1920;
-								videoConfig.outputHeight = 1080;
-								videoConfig.fps = 60;
-						} else if (quality == "source") {
-								videoConfig.outputWidth = videoConfig.baseWidth;
-								videoConfig.outputHeight = videoConfig.baseHeight;
-								videoConfig.fps = 60;
-						} else {
-								std::cerr << "[Native Stream Service] unknown quality, falling back to 720p60: "
-													<< quality
-													<< "\n";
-						}
-
-						if (!g_engine) {
-								g_engine =
-										std::make_unique<ObsEngine>();
-
-								if (
-										!g_engine->initialize(
-												get_runtime_dir(),
-												videoConfig
-										)
-								) {
-										shutdown_engine_state();
-
-										send_json(
-												"{\"id\":" +
-												std::to_string(id) +
-												",\"ok\":false,"
-												"\"error\":\"OBS initialize failed\"}"
-										);
-
-										continue;
-								}
-						} else {
-								if (
-										!g_engine->configureVideo(
-												videoConfig
-										)
-								) {
-										shutdown_engine_state();
-
-										send_json(
-												"{\"id\":" +
-												std::to_string(id) +
-												",\"ok\":false,"
-												"\"error\":\"OBS video configure failed\"}"
-										);
-
-										continue;
-								}
-						}
-
-						if (!g_engine->createCaptureScene(
-										captureType,
-										hwnd,
-										1000,
-										false,
-										monitorIndex
-								)) {
-					
-								cleanup_active_capture_state();
-								send_json(
-										"{\"id\":" + std::to_string(id) +
-										",\"ok\":false,\"error\":\"create capture scene failed\"}"
-								);
-								continue;
-						}
-
-						uint32_t captureFrameWidth = 0;
-						uint32_t captureFrameHeight = 0;
-
-						if (
-								!g_engine->waitForCaptureFrame(
-										3000,
-										captureFrameWidth,
-										captureFrameHeight
-								)
-						) {
-								cleanup_active_capture_state();
-								send_json(
-										"{\"id\":" +
-										std::to_string(id) +
-										",\"ok\":false,"
-										"\"error\":\"capture frame unavailable\"}"
-								);
-
-								continue;
-						}
-
-						std::cerr
-								<< "[Native Stream Service] "
-								<< "first capture frame confirmed "
-								<< captureFrameWidth
-								<< "x"
-								<< captureFrameHeight
-								<< "\n";
-
-						const bool audioStreamingEnabled =
-										audioRtpEnabled &&
-										audio != "none";
-
-						bool audioOk = true;
-
-						if (!audioStreamingEnabled) {
-										std::cerr
-														<< "[Native Stream Service] "
-														<< "audio capture disabled\n";
-						} else if (audio == "desktop") {
-										audioOk =
-														g_engine->createDesktopAudioSource();
-						} else if (audio == "process") {
-										audioOk =
-														g_engine->createProcessAudioSource(hwnd);
-						} else {
-										if (captureType == CaptureType::Monitor) {
-														audioOk =
-																		g_engine->createDesktopAudioSource();
-										} else {
-														audioOk =
-																		g_engine->createProcessAudioSource(hwnd);
-
-														if (!audioOk) {
-																		audioOk =
-																						g_engine->createDesktopAudioSource();
-														}
-										}
-						}
-
-						if (!audioOk) {
-								cleanup_active_capture_state();
-								send_json(
-										"{\"id\":" + std::to_string(id) +
-										",\"ok\":false,\"error\":\"create audio source failed\"}"
-								);
-								continue;
-						}
-
-						if (rtpEnabled) {
-								int bitrate = 6000;
-
-								if (quality == "720p30") {
-										bitrate = 2500;
-								} else if (quality == "720p60") {
-										bitrate = 4500;
-								} else if (quality == "1080p30") {
-										bitrate = 5500;
-								} else if (quality == "1080p60" || quality == "source") {
-										bitrate = 8000;
-								} else {
-										bitrate = 4500;
-								}
-
-								if (!g_engine->startRtpStreaming(
-												rtpIp,
-												rtpPort,
-												payloadType,
-												ssrc,
-												bitrate,
-												encoder,
-												audioStreamingEnabled ? audioRtpIp : std::string{},
-												audioStreamingEnabled ? audioRtpPort : 0,
-												audioPayloadType,
-												audioStreamingEnabled ? audioSsrc : 0,
-												rtxSsrc,
-												rtxPayloadType
-								)) {
-										cleanup_active_capture_state();
-										send_json(
-												"{\"id\":" + std::to_string(id) +
-												",\"ok\":false,\"error\":\"start RTP streaming failed\"}"
-										);
-
-										continue;
-								}
-						}								
-
-						g_captureActive.store(
-								true,
-								std::memory_order_release
-						);
-
-						g_captureStarting.store(
-								false,
-								std::memory_order_release
-						);
-
-						g_captureEndedNotified.store(
-								false,
-								std::memory_order_release
-						);
+						).detach();
 
 						send_json(
 								"{\"id\":" + std::to_string(id) +
-								",\"ok\":true,\"type\":\"captureStarted\"}"
+								",\"ok\":true,\"type\":\"captureStarting\"}"
 						);
 
 						continue;
 				}
 	
 				if (line.find("\"type\":\"stopCapture\"") != std::string::npos) {
+						if (
+								g_captureStarting.load(std::memory_order_acquire) &&
+								!g_captureActive.load(std::memory_order_acquire)
+						) {
+								g_cancelRequested.store(
+										true,
+										std::memory_order_release
+								);
+
+								send_json(
+										"{\"id\":" + std::to_string(id) +
+										",\"ok\":true,\"type\":\"captureStopped\"}"
+								);
+
+								continue;
+						}
+
 						cleanup_active_capture_state();
 
 						send_json(
@@ -1427,6 +1575,46 @@ int runNativeService()
 								",\"ok\":true,"
 								"\"type\":\"shutdown_ack\"}"
 						);
+
+						g_cancelRequested.store(
+								true,
+								std::memory_order_release
+						);
+
+						if (
+								g_captureStarting.load(std::memory_order_acquire) &&
+								!g_captureActive.load(std::memory_order_acquire)
+						) {
+								std::cerr << "[Native Stream Service] shutdown: waiting for startCapture worker to finish...\n";
+
+								constexpr int kMaxWaitMs = 3000;
+								int waited = 0;
+
+								while (
+										g_captureStarting.load(std::memory_order_acquire) &&
+										waited < kMaxWaitMs
+								) {
+										std::this_thread::sleep_for(
+												std::chrono::milliseconds(50)
+										);
+
+										waited += 50;
+								}
+
+								if (
+										g_captureStarting.load(std::memory_order_acquire)
+								) {
+										std::cerr
+												<< "[Native Stream Service] "
+												<< "shutdown: worker did not finish in time,"
+												<< " terminating process directly to avoid"
+												<< " touching g_engine unsafely\n";
+
+										std::cerr.flush();
+
+										std::_Exit(0);
+								}
+						}
 
 						shutdown_engine_state();
 
