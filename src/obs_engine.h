@@ -5,10 +5,14 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <mutex>
 
 #include "native_wgc_source.h"
 #include "bitrate_update_scheduler.h"
 #include "network_feedback.h"
+#if defined(__linux__)
+#include "linux_source_utils.h"
+#endif
 
 struct ObsVideoConfig {
     int baseWidth = 1920;
@@ -52,7 +56,11 @@ public:
         int delayMs,
         bool debugFrames
     );
-    bool createProcessAudioSource(uintptr_t hwnd);
+    
+    bool createProcessAudioSource(
+        uintptr_t hwnd,
+        const std::string& targetName = {}
+    );
 
     bool startRtpStreaming(
         const std::string& rtpIp,
@@ -76,6 +84,10 @@ public:
         const std::atomic<bool>* cancelFlag = nullptr
     ) const;
 
+    #if defined(__linux__)
+        LinuxPortalWindowMatch activePortalWindowMatch() const;
+    #endif
+
     void stopRtpStreaming();
 
     void clearCapture();
@@ -89,11 +101,33 @@ public:
         uint32_t& width,
         uint32_t& height
     ) const;
-
+    bool isOutputStateUnstable() const;
+    
 private:
     std::string toUtf8Path(const std::filesystem::path& path);
     bool shutdownCalled_ = false;
     bool captureCleared_ = false;
+
+    #if defined(__linux__)
+        mutable std::mutex linuxPortalWindowMatchMutex_;
+        mutable LinuxPortalWindowMatch linuxPortalWindowMatch_;
+
+        bool createPipeWireScene(
+            CaptureType captureType,
+            int monitorIndex,
+            bool debugFrames
+        );
+    #endif
+
+    bool applyEffectiveTargetBitrateLocked(
+        uint32_t effectiveTargetBitrateBps,
+        const char* source
+    );
+
+    std::mutex bitratePolicyMutex_;
+
+    uint32_t policyCeilingBps_ = 0;
+    uint32_t localDesiredBitrateBps_ = 0;
 
     BitrateUpdateScheduler bitrateUpdateScheduler_;
 };

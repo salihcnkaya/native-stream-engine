@@ -10,10 +10,15 @@
 #include <chrono>
 #include <future>
 #include "window_utils.h"
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <objbase.h>
 #include <roapi.h>
+#elif defined(__linux__)
+#include <glib.h>
+#include "linux_source_utils.h"
+#endif
 #include "native_wgc_source.h"
 #include "realtime_rtp_sender.h"
 #include <util/base.h>
@@ -27,6 +32,9 @@ namespace fs = std::filesystem;
 static obs_scene_t* g_scene = nullptr;
 static obs_sceneitem_t* g_captureSceneItem = nullptr;
 static obs_source_t* g_captureSource = nullptr;
+#if defined(__linux__)
+static std::string g_linuxSelectedAudioTarget;
+#endif
 
 static std::atomic<bool> g_obsOutputStateUnstable{ false };
 
@@ -51,6 +59,8 @@ static RealtimeRtpSender g_realtimeRtpAudioSender;
 static void handleRtpEncodedPacket(
     encoder_packet* packet
 );
+
+static uint32_t readRtpVideoEncoderConfiguredBitrate();
 
 #if defined(NDEBUG)
 static constexpr bool STREAM_DEBUG_BITRATE_DECISIONS = false;
@@ -196,6 +206,7 @@ bool ObsEngine::waitForCaptureFrame(
     const std::atomic<bool>* cancelFlag
 ) const
 {
+    #if defined(_WIN32)
     width = 0;
     height = 0;
 
@@ -278,6 +289,462 @@ bool ObsEngine::waitForCaptureFrame(
             std::chrono::milliseconds(10)
         );
     }
+    #else
+
+        width = 0;
+        height = 0;
+
+        if (timeoutMs < 0) {
+            timeoutMs = 0;
+        }
+
+        const auto startedAt =
+            std::chrono::steady_clock::now();
+
+        const auto timeout =
+            std::chrono::milliseconds(
+                timeoutMs
+            );
+
+        while (true) {
+            while (
+                g_main_context_iteration(
+                    nullptr,
+                    false
+                )
+            ) {
+
+            }
+            
+            if (
+                cancelFlag &&
+                cancelFlag->load(
+                    std::memory_order_acquire
+                )
+            ) {
+                std::cerr
+                    << "[Native Stream Engine] "
+                    << "PipeWire capture frame wait aborted"
+                    << " reason=cancelled\n";
+
+                return false;
+            }
+
+            if (g_captureSource) {
+                const uint32_t sourceWidth =
+                    obs_source_get_width(
+                        g_captureSource
+                    );
+
+                const uint32_t sourceHeight =
+                    obs_source_get_height(
+                        g_captureSource
+                    );
+
+                if (
+                    sourceWidth > 0 &&
+                    sourceHeight > 0
+                ) {
+                    width = sourceWidth;
+                    height = sourceHeight;
+
+                    obs_data_t* privateSettings =
+                        obs_source_get_private_settings(
+                            g_captureSource
+                        );
+
+                    if (privateSettings) {
+                        const char* portalAppId =
+                            obs_data_get_string(
+                                privateSettings,
+                                "__nse_linux_portal_app_id"
+                            );
+
+                        LinuxPortalWindowIdentity portalWindowIdentity;
+
+                        const char* restoreToken =
+                            obs_data_get_string(
+                                privateSettings,
+                                "__nse_linux_restore_token"
+                            );
+
+                        std::cerr
+                            << "[Native Stream Engine] "
+                            << "portal restore token from source="
+                            << (
+                                restoreToken && *restoreToken
+                                    ? restoreToken
+                                    : "<none>"
+                            )
+                            << "\n";
+
+                        if (restoreToken && *restoreToken) {
+                            portalWindowIdentity =
+                                resolveLinuxPortalWindowIdentityFromRestoreToken(
+                                    restoreToken
+                                );
+
+                            std::cerr
+                                << "[Native Stream Engine] "
+                                << "resolved portal restore identity"
+                                << " appId="
+                                << (
+                                    portalWindowIdentity.appId.empty()
+                                        ? "<none>"
+                                        : portalWindowIdentity.appId
+                                )
+                                << " title="
+                                << (
+                                    portalWindowIdentity.title.empty()
+                                        ? "<none>"
+                                        : portalWindowIdentity.title
+                                )
+                                << "\n";
+                        }
+
+                        LinuxPortalWindowMatch resolvedWindowMatch;
+
+                        if (portalWindowIdentity.valid()) {
+                            std::cerr
+                                << "[Native Stream Engine] "
+                                << "portal identity available for audio resolution"
+                                << " appId="
+                                << portalWindowIdentity.appId
+                                << " title="
+                                << portalWindowIdentity.title
+                                << "\n";
+
+                            resolvedWindowMatch =
+                                resolveLinuxPortalWindowMatch(
+                                    portalWindowIdentity
+                                );
+
+                            {
+                                std::lock_guard<std::mutex> lock(
+                                    linuxPortalWindowMatchMutex_
+                                );
+
+                                linuxPortalWindowMatch_ =
+                                    resolvedWindowMatch;
+                            }
+
+                            if (resolvedWindowMatch.valid()) {
+                                std::cerr
+                                    << "[Native Stream Engine] "
+                                    << "active portal window stored"
+                                    << " uuid="
+                                    << resolvedWindowMatch.uuid
+                                    << " pid="
+                                    << resolvedWindowMatch.pid
+                                    << "\n";
+                            }
+                        }
+
+                        std::cerr
+                            << "[Native Stream Engine] "
+                            << "portal app identity from source="
+                            << (
+                                portalAppId && *portalAppId
+                                    ? portalAppId
+                                    : "<none>"
+                            )
+                            << "\n";
+
+                        const std::string portalExecutableTarget =
+                            resolveLinuxExecutableTargetFromPid(
+                                resolvedWindowMatch.pid
+                            );
+
+                        if (!portalExecutableTarget.empty()) {
+                            std::cerr
+                                << "[Native Stream Engine] "
+                                << "portal executable target="
+                                << portalExecutableTarget
+                                << "\n";
+                        }
+                        
+                        const std::vector<LinuxAudioApplication> audioApps =
+                            listLinuxAudioApplications();
+
+                        const uint32_t portalWindowPid =
+                            resolvedWindowMatch.pid;
+
+                        const LinuxAudioApplication* portalPidAudioApp = nullptr;
+
+                        if (portalWindowPid != 0) {
+                            for (const auto& audioApp : audioApps) {
+                                if (audioApp.pid != portalWindowPid) {
+                                    continue;
+                                }
+
+                                if (portalPidAudioApp) {
+                                    std::cerr
+                                        << "[Native Stream Engine] "
+                                        << "multiple audio applications matched portal window pid="
+                                        << portalWindowPid
+                                        << "; refusing ambiguous PID audio selection"
+                                        << "\n";
+
+                                    portalPidAudioApp = nullptr;
+                                    break;
+                                }
+
+                                portalPidAudioApp = &audioApp;
+                            }
+                        }
+
+                        if (portalPidAudioApp) {
+                            std::cerr
+                                << "[Native Stream Engine] "
+                                << "portal PID audio application match"
+                                << " pid=" << portalPidAudioApp->pid
+                                << " name=" << portalPidAudioApp->name
+                                << " binary=" << portalPidAudioApp->binary
+                                << " nodeName=" << portalPidAudioApp->nodeName
+                                << "\n";
+                        }
+
+                        const std::string portalResolvedAudioTarget =
+                            resolveLinuxPortalAudioTarget(
+                                portalWindowIdentity,
+                                audioApps
+                            );
+
+                        std::cerr
+                            << "[Native Stream Engine] "
+                            << "portal resolved audio target="
+                            << (
+                                portalResolvedAudioTarget.empty()
+                                    ? "<none>"
+                                    : portalResolvedAudioTarget
+                            )
+                            << "\n";
+
+                        const LinuxAudioApplication* uniqueGameAudioApp =
+                            findUniqueLinuxGameAudioApplication(
+                                audioApps
+                            );
+
+                        const LinuxAudioApplication* uniqueWineAudioApp =
+                            findUniqueLinuxWineAudioApplication(
+                                audioApps
+                            );
+                        
+                        if (uniqueWineAudioApp) {
+                            std::cerr
+                                << "[Native Stream Engine] "
+                                << "unique Wine audio candidate"
+                                << " name=" << uniqueWineAudioApp->name
+                                << " binary=" << uniqueWineAudioApp->binary
+                                << " pid=" << uniqueWineAudioApp->pid
+                                << "\n";
+                        } else {
+                            std::cerr
+                                << "[Native Stream Engine] "
+                                << "unique Wine audio candidate not found"
+                                << "\n";
+                        }
+
+                        if (uniqueGameAudioApp) {
+                            std::cerr
+                                << "[Native Stream Engine] "
+                                << "unique game audio candidate"
+                                << " name=" << uniqueGameAudioApp->name
+                                << " binary=" << uniqueGameAudioApp->binary
+                                << " pid=" << uniqueGameAudioApp->pid
+                                << "\n";
+                        } else {
+                            std::cerr
+                                << "[Native Stream Engine] "
+                                << "unique game audio candidate not found"
+                                << "\n";
+                        }
+
+                       if (
+                            portalPidAudioApp &&
+                            !portalPidAudioApp->name.empty()
+                        ) {
+                            g_linuxSelectedAudioTarget =
+                                portalPidAudioApp->name;
+
+                            std::cerr
+                                << "[Native Stream Engine] "
+                                << "selected audio target from portal window PID="
+                                << g_linuxSelectedAudioTarget
+                                << "\n";
+                        } else if (!portalExecutableTarget.empty()) {
+                            g_linuxSelectedAudioTarget =
+                                portalExecutableTarget;
+
+                            std::cerr
+                                << "[Native Stream Engine] "
+                                << "selected audio target from portal window executable fallback="
+                                << g_linuxSelectedAudioTarget
+                                << "\n";
+                        } else if (!portalResolvedAudioTarget.empty()) {
+                            g_linuxSelectedAudioTarget =
+                                portalResolvedAudioTarget;
+
+                            std::cerr
+                                << "[Native Stream Engine] "
+                                << "selected audio target from portal restore identity="
+                                << g_linuxSelectedAudioTarget
+                                << "\n";
+                        } else if (portalAppId && *portalAppId) {
+                            const LinuxApplicationIdentity identity =
+                                resolveLinuxApplicationIdentity(
+                                    portalAppId
+                                );
+
+                            std::cerr
+                                << "[Native Stream Engine] "
+                                << "resolved portal application"
+                                << " portalId=" << identity.portalId
+                                << " desktopId=" << identity.desktopId
+                                << " name=" << identity.displayName
+                                << " startupWMClass=" << identity.startupWMClass
+                                << " exec=" << identity.execBasename
+                                << " aliases=[";
+
+                            for (
+                                size_t i = 0;
+                                i < identity.aliases.size();
+                                ++i
+                            ) {
+                                if (i > 0) {
+                                    std::cerr << ", ";
+                                }
+
+                                std::cerr
+                                    << identity.aliases[i];
+                            }
+
+                            std::cerr << "]\n";
+
+                            const LinuxAudioApplication* exactAudioMatch =
+                                findExactLinuxAudioApplicationMatch(
+                                    identity,
+                                    audioApps
+                                );
+
+                            if (exactAudioMatch) {
+                                std::cerr
+                                    << "[Native Stream Engine] "
+                                    << "exact audio application match"
+                                    << " name=" << exactAudioMatch->name
+                                    << " binary=" << exactAudioMatch->binary
+                                    << " pid=" << exactAudioMatch->pid
+                                    << " nodeName=" << exactAudioMatch->nodeName
+                                    << "\n";
+
+                                g_linuxSelectedAudioTarget =
+                                    exactAudioMatch->binary;
+
+                                std::cerr
+                                    << "[Native Stream Engine] "
+                                    << "selected audio target="
+                                    << g_linuxSelectedAudioTarget
+                                    << "\n";
+                            } else {
+                                std::cerr
+                                    << "[Native Stream Engine] "
+                                    << "exact audio application match not found"
+                                    << "\n";
+
+                                if (!identity.displayName.empty()) {
+                                    g_linuxSelectedAudioTarget =
+                                        identity.displayName;
+
+                                    std::cerr
+                                        << "[Native Stream Engine] "
+                                        << "selected audio target from portal identity="
+                                        << g_linuxSelectedAudioTarget
+                                        << "\n";
+                                }
+                            }
+                        } else if (
+                            !portalWindowIdentity.valid() &&
+                            uniqueGameAudioApp
+                        ) {
+                            g_linuxSelectedAudioTarget =
+                                uniqueGameAudioApp->binary;
+
+                            std::cerr
+                                << "[Native Stream Engine] "
+                                << "selected audio target from unique game fallback="
+                                << g_linuxSelectedAudioTarget
+                                << "\n";
+                        } else if (
+                            !portalWindowIdentity.valid() &&
+                            uniqueWineAudioApp
+                        ) {
+                            g_linuxSelectedAudioTarget =
+                                uniqueWineAudioApp->name;
+
+                            std::cerr
+                                << "[Native Stream Engine] "
+                                << "selected audio target from unique Wine fallback="
+                                << g_linuxSelectedAudioTarget
+                                << "\n";
+                        }
+
+                        obs_data_release(
+                            privateSettings
+                        );
+                    }
+
+                    std::cerr
+                        << "[Native Stream Engine] "
+                        << "PipeWire capture source ready "
+                        << width
+                        << "x"
+                        << height
+                        << "\n";
+
+                    return true;
+                }
+            }
+
+            const auto now =
+                std::chrono::steady_clock::now();
+
+            if (
+                now - startedAt >= timeout
+            ) {
+                std::cerr
+                    << "[Native Stream Engine] "
+                    << "PipeWire capture frame wait timed out"
+                    << " timeoutMs="
+                    << timeoutMs
+                    << "\n";
+
+                return false;
+            }
+
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(50)
+            );
+        }
+
+    #endif
+}
+
+#if defined(__linux__)
+LinuxPortalWindowMatch ObsEngine::activePortalWindowMatch() const
+{
+    std::lock_guard<std::mutex> lock(
+        linuxPortalWindowMatchMutex_
+    );
+
+    return linuxPortalWindowMatch_;
+}
+#endif
+
+bool ObsEngine::isOutputStateUnstable() const
+{
+    return g_obsOutputStateUnstable.load(
+        std::memory_order_acquire
+    );
 }
 
 bool ObsEngine::copyCaptureFrameBgra(
@@ -286,6 +753,7 @@ bool ObsEngine::copyCaptureFrameBgra(
     uint32_t& height
 ) const
 {
+    #if defined(_WIN32)
     pixels.clear();
     width = 0;
     height = 0;
@@ -363,6 +831,11 @@ bool ObsEngine::copyCaptureFrameBgra(
         << "\n";
 
     return true;
+    #else
+
+        return false;
+
+    #endif
 }
 
 static size_t startCodeLength(const uint8_t* data, size_t size, size_t pos)
@@ -509,6 +982,7 @@ bool ObsEngine::createWgcScene(
 		bool debugFrames
 )
 {
+    #if defined(_WIN32)
     setWgcConfig(targetType, hwnd, monitorIndex, delayMs, debugFrames);
 
     obs_scene_t* scene =
@@ -661,7 +1135,211 @@ bool ObsEngine::createWgcScene(
     }
 
     return true;
+    #else
+
+        return false;
+
+    #endif
 }
+
+#if defined(__linux__)
+
+bool ObsEngine::createPipeWireScene(
+    CaptureType captureType,
+    int monitorIndex,
+    bool debugFrames
+)
+{
+    (void)monitorIndex;
+    (void)debugFrames;
+    g_linuxSelectedAudioTarget.clear();
+
+    const char* sourceId = nullptr;
+    const char* sourceName = nullptr;
+
+    switch (captureType) {
+        case CaptureType::Monitor:
+            sourceId =
+                "pipewire-desktop-capture-source";
+            sourceName =
+                "Native PipeWire Monitor Capture";
+            break;
+
+        case CaptureType::Window:
+        case CaptureType::Game:
+        case CaptureType::Wgc:
+            sourceId =
+                "pipewire-window-capture-source";
+            sourceName =
+                "Native PipeWire Window Capture";
+            break;
+
+        default:
+            std::cerr
+                << "[Native Stream Engine] "
+                << "unsupported Linux capture type\n";
+
+            return false;
+    }
+
+    std::cerr
+        << "[Native Stream Engine] "
+        << "creating PipeWire capture"
+        << " sourceId="
+        << sourceId
+        << "\n";
+
+    obs_scene_t* scene =
+        obs_scene_create_private(
+            "Native PipeWire Scene"
+        );
+
+    if (!scene) {
+        std::cerr
+            << "[Native Stream Engine] "
+            << "failed to create PipeWire scene\n";
+
+        return false;
+    }
+
+    obs_data_t* settings =
+        obs_data_create();
+
+    obs_data_set_bool(
+        settings,
+        "ShowCursor",
+        true
+    );
+
+    obs_source_t* pipeWireSource =
+        obs_source_create_private(
+            sourceId,
+            sourceName,
+            settings
+        );
+
+    obs_data_release(settings);
+
+    if (!pipeWireSource) {
+        std::cerr
+            << "[Native Stream Engine] "
+            << "failed to create PipeWire source"
+            << " sourceId="
+            << sourceId
+            << "\n";
+
+        obs_scene_release(scene);
+
+        return false;
+    }
+
+    obs_sceneitem_t* item =
+        obs_scene_add(
+            scene,
+            pipeWireSource
+        );
+
+    if (!item) {
+        std::cerr
+            << "[Native Stream Engine] "
+            << "failed to add PipeWire source to scene\n";
+
+        obs_source_release(pipeWireSource);
+        obs_scene_release(scene);
+
+        return false;
+    }
+
+    obs_video_info videoInfo{};
+
+    if (!obs_get_video_info(&videoInfo)) {
+        std::cerr
+            << "[Native Stream Engine] "
+            << "failed to read OBS video info"
+            << " for PipeWire scene\n";
+
+        obs_sceneitem_remove(item);
+        obs_source_release(pipeWireSource);
+        obs_scene_release(scene);
+
+        return false;
+    }
+
+    vec2 itemPosition{};
+    vec2_set(
+        &itemPosition,
+        0.0f,
+        0.0f
+    );
+
+    vec2 itemBounds{};
+    vec2_set(
+        &itemBounds,
+        static_cast<float>(
+            videoInfo.base_width
+        ),
+        static_cast<float>(
+            videoInfo.base_height
+        )
+    );
+
+    obs_sceneitem_set_alignment(
+        item,
+        OBS_ALIGN_LEFT |
+        OBS_ALIGN_TOP
+    );
+
+    obs_sceneitem_set_pos(
+        item,
+        &itemPosition
+    );
+
+    obs_sceneitem_set_bounds_type(
+        item,
+        OBS_BOUNDS_SCALE_INNER
+    );
+
+    obs_sceneitem_set_bounds_alignment(
+        item,
+        OBS_ALIGN_CENTER
+    );
+
+    obs_sceneitem_set_bounds(
+        item,
+        &itemBounds
+    );
+
+    captureCleared_ = false;
+
+    g_scene = scene;
+    g_captureSceneItem = item;
+    g_captureSource = pipeWireSource;
+
+    obs_source_t* sceneSource =
+        obs_scene_get_source(
+            scene
+        );
+
+    obs_set_output_source(
+        0,
+        sceneSource
+    );
+
+    std::cerr
+        << "[Native Stream Engine] "
+        << "PipeWire scene created"
+        << " canvas="
+        << videoInfo.base_width
+        << "x"
+        << videoInfo.base_height
+        << " sourceId="
+        << sourceId
+        << "\n";
+
+    return true;
+}
+
+#endif
 
 bool ObsEngine::createCaptureScene(
     CaptureType captureType,
@@ -671,6 +1349,7 @@ bool ObsEngine::createCaptureScene(
     int monitorIndex
 )
 {
+    #if defined(_WIN32)
     if (captureType == CaptureType::Monitor) {
         return createWgcScene(
             WgcTargetType::Monitor,
@@ -699,6 +1378,21 @@ bool ObsEngine::createCaptureScene(
     }
 
     return false;
+
+    #elif defined(__linux__)
+
+        return createPipeWireScene(
+            captureType,
+            monitorIndex,
+            debugFrames
+        );
+
+    #else
+
+        return false;
+
+    #endif
+
 }
 
 bool ObsEngine::configureVideo(
@@ -707,7 +1401,11 @@ bool ObsEngine::configureVideo(
 {
     obs_video_info ovi = {};
 
+    #if defined(_WIN32)
     ovi.graphics_module = "libobs-d3d11";
+    #else
+    ovi.graphics_module = "libobs-opengl";
+    #endif
     ovi.fps_num = videoConfig.fps;
     ovi.fps_den = 1;
 
@@ -793,20 +1491,45 @@ bool ObsEngine::initialize(
     shutdownCalled_ = false;
     captureCleared_ = false;
 
+    #if defined(_WIN32)
     resetWgcTargetClosed();
+    #endif
 
     bitrateUpdateScheduler_.reset();
+
+    #if defined(_WIN32)
     const auto binDir = runtimeDir / "bin" / "64bit";
     const auto pluginBinDir = runtimeDir / "obs-plugins" / "64bit";
+    #else
+    const auto binDir = runtimeDir / "bin";
+    const auto pluginBinDir = runtimeDir / "obs-plugins";
+    #endif
     const auto pluginDataDir = runtimeDir / "data" / "obs-plugins";
     const auto libobsDataDir = runtimeDir / "data" / "libobs";
 
     std::cerr << "[Native Stream Engine] runtime: " << runtimeDir.string() << "\n";
 
+    #if defined(_WIN32)
+
     if (!fs::exists(binDir / "obs.dll")) {
         std::cerr << "obs.dll not found: " << (binDir / "obs.dll").string() << "\n";
         return false;
     }
+
+    #else
+
+    if (!fs::exists(runtimeDir / "lib" / "libobs.so")) {
+        std::cerr
+            << "libobs.so not found: "
+            << (runtimeDir / "lib" / "libobs.so").string()
+            << "\n";
+
+        return false;
+    }
+
+    #endif
+
+        #if defined(_WIN32)
 
 		HRESULT coResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 		if (FAILED(coResult) && coResult != RPC_E_CHANGED_MODE) {
@@ -817,6 +1540,8 @@ bool ObsEngine::initialize(
 		if (FAILED(roResult) && roResult != RPC_E_CHANGED_MODE) {
 				std::cerr << "RoInitialize failed: " << std::hex << roResult << "\n";
 		}
+
+        #endif
 
     base_set_log_handler(
         nativeObsLogHandler,
@@ -849,20 +1574,59 @@ bool ObsEngine::initialize(
     std::cerr << "Found default.effect: " << defaultEffectPath << "\n";
     bfree(defaultEffectPath);
 
+    #if !defined(_WIN32)
+
+    if (!configureVideo(videoConfig)) {
+        std::cerr
+            << "[Native Stream Engine] "
+            << "initial video configuration failed\n";
+
+        obs_shutdown();
+        return false;
+    }
+
+    #endif
+
+    #if defined(_WIN32)
+
+    const std::string moduleBinPattern =
+            toUtf8Path(pluginBinDir) + "/%module%.dll";
+
+    #else
+
+        const std::string moduleBinPattern =
+            toUtf8Path(pluginBinDir) + "/%module%.so";
+
+    #endif
+
+    const std::string moduleDataPattern =
+        toUtf8Path(pluginDataDir) + "/%module%";
+
     obs_add_module_path(
-        toUtf8Path(pluginBinDir).c_str(),
-        (toUtf8Path(pluginDataDir) + "/%module%").c_str()
+        moduleBinPattern.c_str(),
+        moduleDataPattern.c_str()
     );
 
+    #if defined(_WIN32)
     const char* safeModules[] = {
         "win-capture.dll",
         "win-wasapi.dll",
         "obs-ffmpeg.dll",
         "obs-x264.dll",
         "obs-qsv11.dll",
-        "obs-amd-encoder.dll",
         "obs-nvenc.dll",
     };
+    #else
+    const char* safeModules[] = {
+        "linux-pipewire.so",
+        "linux-pulseaudio.so",
+        "linux-pipewire-audio.so",
+        "obs-ffmpeg.so",
+        "obs-x264.so",
+        "obs-qsv11.so",
+        "obs-nvenc.so"
+    };
+    #endif
 
     for (const char* moduleName : safeModules) {
         obs_module_t* module = nullptr;
@@ -896,7 +1660,30 @@ bool ObsEngine::initialize(
 
     obs_post_load_modules();
 
+    std::cerr
+        << "[Native Stream Engine] registered encoders:\n";
+
+    for (size_t index = 0;; ++index) {
+        const char* encoderId = nullptr;
+
+        if (!obs_enum_encoder_types(
+                index,
+                &encoderId
+            )) {
+            break;
+        }
+
+        if (encoderId) {
+            std::cerr
+                << "  encoder: "
+                << encoderId
+                << "\n";
+        }
+    }
+
+    #if defined(_WIN32)
     registerWgcSource();
+    #endif
 
     setNativeRtpOutputPacketHandler(
         handleRtpEncodedPacket
@@ -904,11 +1691,18 @@ bool ObsEngine::initialize(
 
     registerNativeRtpOutput();
 
+    #if defined(_WIN32)
+
     if (!configureVideo(videoConfig)) {
+        std::cerr
+            << "[Native Stream Engine] "
+            << "initial video configuration failed\n";
+
         obs_shutdown();
         return false;
     }
 
+    #endif
 
     obs_audio_info ai = {};
     ai.samples_per_sec = 48000;
@@ -1265,14 +2059,49 @@ static obs_data_t* createRtpVideoEncoderSettings(
 
 bool ObsEngine::createDesktopAudioSource()
 {
-    std::cerr << "\nCreating desktop audio source...\n";
+    std::cerr
+        << "\nCreating desktop audio source...\n";
 
-    obs_data_t* settings = obs_data_create();
-    obs_data_set_string(settings, "device_id", "default");
+    obs_data_t* settings =
+        obs_data_create();
+
+    obs_data_set_string(
+        settings,
+        "device_id",
+        "default"
+    );
+
+#if defined(_WIN32)
+
+    constexpr const char* sourceId =
+        "wasapi_output_capture";
+
+    constexpr const char* sourceName =
+        "Native Desktop Audio";
+
+#elif defined(__linux__)
+
+    constexpr const char* sourceId =
+        "pulse_output_capture";
+
+    constexpr const char* sourceName =
+        "Native Desktop Audio";
+
+#else
+
+    obs_data_release(settings);
+
+    std::cerr
+        << "Desktop audio capture is not supported "
+        << "on this platform\n";
+
+    return false;
+
+#endif
 
     g_audioSource = obs_source_create(
-        "wasapi_output_capture",
-        "Native Desktop Audio",
+        sourceId,
+        sourceName,
         settings,
         nullptr
     );
@@ -1280,25 +2109,51 @@ bool ObsEngine::createDesktopAudioSource()
     obs_data_release(settings);
 
     if (!g_audioSource) {
-        std::cerr << "Failed to create wasapi_output_capture source\n";
+        std::cerr
+            << "Failed to create desktop audio source"
+            << " sourceId="
+            << sourceId
+            << "\n";
+
         return false;
     }
 
-    obs_source_set_audio_mixers(g_audioSource, 1);
-    obs_set_output_source(1, g_audioSource);
+    obs_source_set_audio_mixers(
+        g_audioSource,
+        1
+    );
 
-    std::cerr << "Desktop audio source created and set as output audio source\n";
+    obs_set_output_source(
+        1,
+        g_audioSource
+    );
+
+    std::cerr
+        << "Desktop audio source created"
+        << " sourceId="
+        << sourceId
+        << " device=default"
+        << "\n";
+
     return true;
 }
 
-bool ObsEngine::createProcessAudioSource(uintptr_t hwnd)
+bool ObsEngine::createProcessAudioSource(
+    uintptr_t hwnd,
+    const std::string& targetName
+)
 {
+#if defined(_WIN32)
+
+    (void)targetName;
+
     std::cerr << "\nCreating process audio source...\n";
 
     WindowInfo info;
     if (!findWindowByHwnd(hwnd, info)) {
-        std::cerr << "Failed to find window for process audio hwnd: "
-                  << hwnd << "\n";
+        std::cerr
+            << "Failed to find window for process audio hwnd: "
+            << hwnd << "\n";
         return false;
     }
 
@@ -1314,12 +2169,17 @@ bool ObsEngine::createProcessAudioSource(uintptr_t hwnd)
 
     obs_data_t* settings = obs_data_create();
 
-    obs_data_set_string(settings, "window", obsWindow.c_str());
+    obs_data_set_string(
+        settings,
+        "window",
+        obsWindow.c_str()
+    );
 
-    // 1 = title exact
-    // 0 = title, else same class
-    // 2 = title, else same executable
-    obs_data_set_int(settings, "priority", 1);
+    obs_data_set_int(
+        settings,
+        "priority",
+        1
+    );
 
     g_audioSource = obs_source_create(
         "wasapi_process_output_capture",
@@ -1331,14 +2191,104 @@ bool ObsEngine::createProcessAudioSource(uintptr_t hwnd)
     obs_data_release(settings);
 
     if (!g_audioSource) {
-        std::cerr << "Failed to create wasapi_process_output_capture source\n";
+        std::cerr
+            << "Failed to create "
+            << "wasapi_process_output_capture source\n";
         return false;
     }
 
-    obs_source_set_audio_mixers(g_audioSource, 1);
-    obs_set_output_source(1, g_audioSource);
+#elif defined(__linux__)
 
-    std::cerr << "Process audio source created and set as output audio source\n";
+    (void)hwnd;
+
+    std::cerr
+        << "\nCreating PipeWire application audio source...\n";
+
+    const std::string effectiveTargetName =
+        !targetName.empty()
+            ? targetName
+            : g_linuxSelectedAudioTarget;
+
+    if (effectiveTargetName.empty()) {
+        std::cerr
+            << "Linux application audio requires targetName\n";
+        return false;
+    }
+
+    obs_data_t* settings = obs_data_create();
+
+    // 0 = single application capture
+    obs_data_set_int(
+        settings,
+        "CaptureMode",
+        0
+    );
+
+    // 0 = prefer/match application process binary
+    obs_data_set_int(
+        settings,
+        "MatchPriorty",
+        0
+    );
+
+    obs_data_set_bool(
+        settings,
+        "ExceptApp",
+        false
+    );
+
+    obs_data_set_string(
+        settings,
+        "TargetName",
+        effectiveTargetName.c_str()
+    );
+
+    g_audioSource = obs_source_create(
+        "pipewire_audio_application_capture",
+        "Native Application Audio",
+        settings,
+        nullptr
+    );
+
+    obs_data_release(settings);
+
+    if (!g_audioSource) {
+        std::cerr
+            << "Failed to create "
+            << "pipewire_audio_application_capture"
+            << " target=" << effectiveTargetName
+            << "\n";
+        return false;
+    }
+
+    std::cerr
+        << "PipeWire application audio source created"
+        << " target=" << effectiveTargetName
+        << "\n";
+
+#else
+
+    (void)hwnd;
+    (void)targetName;
+
+    std::cerr
+        << "Process/application audio capture "
+        << "is not supported on this platform\n";
+
+    return false;
+
+#endif
+
+    obs_source_set_audio_mixers(
+        g_audioSource,
+        1
+    );
+
+    obs_set_output_source(
+        1,
+        g_audioSource
+    );
+
     return true;
 }
 
@@ -1549,10 +2499,15 @@ bool ObsEngine::startRtpStreaming(
         static_cast<uint32_t>(bitrate * 1000)
     );
 
-    bitrateUpdateScheduler_.reset();
-    bitrateUpdateScheduler_.update(
-        static_cast<uint32_t>(bitrate * 1000)
-    );
+    {
+        std::lock_guard<std::mutex> lock(
+            bitratePolicyMutex_
+        );
+
+        bitrateUpdateScheduler_.reset();
+        policyCeilingBps_ = 0;
+        localDesiredBitrateBps_ = 0;
+    }
 
     if (
         !g_realtimeRtpSender.start(
@@ -1638,12 +2593,25 @@ bool ObsEngine::startRtpStreaming(
             obs_get_video()
         );
 
+        const char* nativeOutputId =
+            audioRtpEnabled
+                ? "native_rtp_av_output"
+                : "native_rtp_video_output";
+
         g_rtpOutput = obs_output_create(
-            "native_rtp_output",
+            nativeOutputId,
             "Native RTP Output",
             nullptr,
             nullptr
         );
+
+        std::cerr
+            << "[Realtime RTP] creating native output"
+            << " outputId="
+            << nativeOutputId
+            << " audio="
+            << (audioRtpEnabled ? "yes" : "no")
+            << "\n";
 
         if (!g_rtpOutput) {
             std::cerr
@@ -1773,6 +2741,45 @@ bool ObsEngine::startRtpStreaming(
         return false;
     }
 
+    const uint32_t startupConfiguredBitrateBps =
+        readRtpVideoEncoderConfiguredBitrate();
+
+    if (startupConfiguredBitrateBps > 0) {
+        {
+            std::lock_guard<std::mutex> lock(
+                bitratePolicyMutex_
+            );
+
+            bitrateUpdateScheduler_.markApplied(
+                startupConfiguredBitrateBps
+            );
+
+            policyCeilingBps_ =
+                startupConfiguredBitrateBps;
+
+            localDesiredBitrateBps_ =
+                startupConfiguredBitrateBps;
+        }
+
+        g_realtimeRtpSender.setAppliedBitrate(
+            startupConfiguredBitrateBps
+        );
+
+        std::cerr
+            << "[Realtime RTP] startup bitrate authority"
+            << " requested="
+            << static_cast<uint32_t>(bitrate * 1000)
+            << " configured="
+            << startupConfiguredBitrateBps
+            << "\n";
+    } else {
+        std::cerr
+            << "[Realtime RTP] startup configured bitrate readback failed"
+            << " requested="
+            << static_cast<uint32_t>(bitrate * 1000)
+            << "\n";
+    }
+
     g_lastPliCount = 0;
     g_lastFirCount = 0;
     g_lastNackPacketCount = 0;
@@ -1791,6 +2798,17 @@ void ObsEngine::stopRtpStreaming()
     }
 
     g_rtpStreaming = false;
+
+    {
+        std::lock_guard<std::mutex> lock(
+            bitratePolicyMutex_
+        );
+
+        policyCeilingBps_ = 0;
+        localDesiredBitrateBps_ = 0;
+
+        bitrateUpdateScheduler_.reset();
+    }
 
     std::cerr
         << "[Realtime RTP] stop requested\n";
@@ -1964,10 +2982,40 @@ static bool requestRtpVideoKeyframe(const char* reason)
     return true;
 }
 
-static void updateRtpVideoEncoderBitrate(uint32_t bitrateBps)
+static uint32_t readRtpVideoEncoderConfiguredBitrate()
+{
+    if (!g_rtpVideoEncoder) {
+        return 0;
+    }
+
+    obs_data_t* settings =
+        obs_encoder_get_settings(g_rtpVideoEncoder);
+
+    if (!settings) {
+        return 0;
+    }
+
+    const int64_t bitrateKbps =
+        obs_data_get_int(
+            settings,
+            "bitrate"
+        );
+
+    obs_data_release(settings);
+
+    if (bitrateKbps <= 0) {
+        return 0;
+    }
+
+    return static_cast<uint32_t>(
+        bitrateKbps * 1000
+    );
+}
+
+static uint32_t updateRtpVideoEncoderBitrate(uint32_t bitrateBps)
 {
     if (!g_rtpVideoEncoder || bitrateBps == 0) {
-        return;
+        return 0;
     }
 
     const int bitrateKbps =
@@ -1993,7 +3041,7 @@ static void updateRtpVideoEncoderBitrate(uint32_t bitrateBps)
             << " encoderId=" << encoderId
             << "\n";
 
-        return;
+        return 0;
     }
 
     obs_data_set_int(
@@ -2034,48 +3082,157 @@ static void updateRtpVideoEncoderBitrate(uint32_t bitrateBps)
 
     obs_data_release(settings);
 
+    obs_data_t* configuredSettings =
+        obs_encoder_get_settings(g_rtpVideoEncoder);
+
+    if (!configuredSettings) {
+        std::cerr
+            << "[Realtime RTP] failed to read configured encoder bitrate"
+            << " requestedBitrateKbps=" << bitrateKbps
+            << " encoderId=" << encoderId
+            << "\n";
+
+        return 0;
+    }
+
+    const int64_t configuredBitrateKbps =
+        obs_data_get_int(
+            configuredSettings,
+            "bitrate"
+        );
+
+    obs_data_release(configuredSettings);
+
+    if (configuredBitrateKbps <= 0) {
+        std::cerr
+            << "[Realtime RTP] invalid configured encoder bitrate"
+            << " requestedBitrateKbps=" << bitrateKbps
+            << " configuredBitrateKbps=" << configuredBitrateKbps
+            << " encoderId=" << encoderId
+            << "\n";
+
+        return 0;
+    }
+
+    const uint32_t configuredBitrateBps =
+        static_cast<uint32_t>(
+            configuredBitrateKbps * 1000
+        );
+
     std::cerr
-        << "[Realtime RTP] encoder bitrate updated"
-        << " bitrateKbps=" << bitrateKbps
+        << "[Realtime RTP] encoder bitrate configured"
+        << " requestedBitrateKbps=" << bitrateKbps
+        << " configuredBitrateKbps=" << configuredBitrateKbps
         << " encoderId=" << encoderId
         << " family=" << encoderFamily
         << "\n";
+
+    return configuredBitrateBps;
 }
 
-
-bool ObsEngine::setTargetBitrate(uint32_t targetBitrateBps)
+bool ObsEngine::applyEffectiveTargetBitrateLocked(
+    uint32_t effectiveTargetBitrateBps,
+    const char* source
+)
 {
     if (
         !g_rtpStreaming ||
         !g_rtpVideoEncoder ||
-        targetBitrateBps == 0
+        effectiveTargetBitrateBps == 0
     ) {
         return false;
     }
 
     const auto scheduled =
-        bitrateUpdateScheduler_.update(targetBitrateBps);
+        bitrateUpdateScheduler_.update(
+            effectiveTargetBitrateBps
+        );
 
     if (scheduled.shouldApply) {
-        updateRtpVideoEncoderBitrate(
-            scheduled.bitrateBps
-        );
+        const uint32_t configuredBitrateBps =
+            updateRtpVideoEncoderBitrate(
+                scheduled.bitrateBps
+            );
+
+        if (configuredBitrateBps > 0) {
+            bitrateUpdateScheduler_.markApplied(
+                configuredBitrateBps
+            );
+
+            g_realtimeRtpSender.setAppliedBitrate(
+                configuredBitrateBps
+            );
+        }
 
         if (STREAM_DEBUG_BITRATE_DECISIONS) {
             std::cerr
-                << "[Realtime RTP] policy target applied"
-                << " requested=" << targetBitrateBps
-                << " applied=" << scheduled.bitrateBps
+                << "[Realtime RTP] effective target "
+                << (configuredBitrateBps > 0 ? "applied" : "failed")
+                << " source="
+                << (source ? source : "unknown")
+                << " effective=" << effectiveTargetBitrateBps
+                << " scheduled=" << scheduled.bitrateBps
+                << " configured=" << configuredBitrateBps
                 << "\n";
         }
     } else if (STREAM_DEBUG_BITRATE_DECISIONS) {
         std::cerr
-            << "[Realtime RTP] policy target held by scheduler"
-            << " requested=" << targetBitrateBps
+            << "[Realtime RTP] effective target held by scheduler"
+            << " source="
+            << (source ? source : "unknown")
+            << " effective=" << effectiveTargetBitrateBps
             << "\n";
     }
 
     return true;
+}
+
+bool ObsEngine::setTargetBitrate(
+    uint32_t targetBitrateBps
+)
+{
+    if (targetBitrateBps == 0) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(
+        bitratePolicyMutex_
+    );
+
+    if (
+        !g_rtpStreaming ||
+        !g_rtpVideoEncoder
+    ) {
+        return false;
+    }
+
+    policyCeilingBps_ =
+        targetBitrateBps;
+
+    if (localDesiredBitrateBps_ == 0) {
+        localDesiredBitrateBps_ =
+            targetBitrateBps;
+    }
+
+    const uint32_t effectiveTargetBitrateBps =
+        std::min(
+            localDesiredBitrateBps_,
+            policyCeilingBps_
+        );
+
+    if (STREAM_DEBUG_BITRATE_DECISIONS) {
+        std::cerr
+            << "[Realtime RTP] external policy updated"
+            << " ceiling=" << policyCeilingBps_
+            << " localDesired=" << localDesiredBitrateBps_
+            << " effective=" << effectiveTargetBitrateBps
+            << "\n";
+    }
+
+    return applyEffectiveTargetBitrateLocked(
+        effectiveTargetBitrateBps,
+        "external-policy"
+    );
 }
 
 void ObsEngine::updateNetworkFeedback(
@@ -2118,6 +3275,45 @@ void ObsEngine::updateNetworkFeedback(
         feedback
     );
 
+    const BitrateDecision bitrateDecision =
+        g_realtimeRtpSender.bitrateDecision();
+
+    if (
+        bitrateDecision.shouldChangeEncoder &&
+        bitrateDecision.targetBitrateBps > 0
+    ) {
+        std::lock_guard<std::mutex> lock(
+            bitratePolicyMutex_
+        );
+
+        localDesiredBitrateBps_ =
+            bitrateDecision.targetBitrateBps;
+
+        const uint32_t effectiveTargetBitrateBps =
+            policyCeilingBps_ > 0
+                ? std::min(
+                    localDesiredBitrateBps_,
+                    policyCeilingBps_
+                )
+                : localDesiredBitrateBps_;
+
+        if (STREAM_DEBUG_BITRATE_DECISIONS) {
+            std::cerr
+                << "[Realtime RTP] controller recommendation"
+                << " desired=" << localDesiredBitrateBps_
+                << " ceiling=" << policyCeilingBps_
+                << " effective=" << effectiveTargetBitrateBps
+                << " stable="
+                << bitrateDecision.stableFeedbackCount
+                << "\n";
+        }
+
+        applyEffectiveTargetBitrateLocked(
+            effectiveTargetBitrateBps,
+            "local-abr"
+        );
+    }
+
     if (feedback.keyframeRequested || hasNewFir) {
         const char* reason = nullptr;
 
@@ -2158,6 +3354,16 @@ void ObsEngine::updateNetworkFeedback(
 void ObsEngine::clearCapture()
 {
     std::cerr << "[Native Stream DIAG] clearCapture() CALLED\n";
+
+    #if defined(__linux__)
+        {
+            std::lock_guard<std::mutex> lock(
+                linuxPortalWindowMatchMutex_
+            );
+
+            linuxPortalWindowMatch_ = {};
+        }
+    #endif
 
     if (captureCleared_) {
         std::cerr << "[Native Stream DIAG] clearCapture: already cleared, returning early\n";
@@ -2256,7 +3462,9 @@ void ObsEngine::clearCapture()
         g_captureSource = nullptr;
         g_scene = nullptr;
 
+        #if defined(_WIN32)
         resetWgcFrameState();
+        #endif
 
         std::cerr
             << "[Native Stream Engine] "
@@ -2278,7 +3486,9 @@ void ObsEngine::clearCapture()
             << " still running in background); OBS state marked"
             << " unstable for a safe shutdown later\n";
 
+        #if defined(_WIN32)
         resetWgcFrameState();
+        #endif
     }
 }
 
@@ -2291,6 +3501,24 @@ void ObsEngine::shutdown()
     shutdownCalled_ = true;
 
     stopRtpStreaming();
+
+    if (
+        g_obsOutputStateUnstable.load(
+            std::memory_order_acquire
+        )
+    ) {
+        std::cerr
+            << "[Native Stream Engine] "
+            << "shutdown: OBS output state is already unstable"
+            << " - skipping capture cleanup and obs_shutdown()"
+            << " to avoid racing with a detached OBS worker;"
+            << " terminating process directly\n";
+
+        std::cerr.flush();
+
+        std::_Exit(1);
+    }
+
     clearCapture();
 
     if (
@@ -2300,10 +3528,8 @@ void ObsEngine::shutdown()
     ) {
         std::cerr
             << "[Native Stream Engine] "
-            << "shutdown: OBS output state is unstable (a prior"
-            << " obs_set_output_source call never returned) - skipping"
-            << " obs_shutdown() to avoid racing with the still-running"
-            << " detached thread, terminating process directly instead\n";
+            << "shutdown: OBS output state became unstable during cleanup"
+            << " - skipping obs_shutdown() and terminating process directly\n";
 
         std::cerr.flush();
 

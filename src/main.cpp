@@ -5,8 +5,10 @@
 #include <string>
 
 #include "native_service.h"
+#if defined(_WIN32)
 #include "wgc_capture.h"
 #include "window_utils.h"
+#endif
 
 namespace fs = std::filesystem;
 
@@ -60,10 +62,21 @@ static void print_usage()
 
 static fs::path get_runtime_dir()
 {
+#if defined(_WIN32)
+
     return
         fs::current_path() /
         "runtime" /
         "OBS-Studio-32.1.2-Windows-x64";
+
+#else
+
+    return
+        fs::current_path() /
+        "runtime" /
+        "OBS-Studio-32.1.2-Linux-x86_64";
+
+#endif
 }
 
 static bool has_json_output_argument(
@@ -87,6 +100,8 @@ static int run_list_sources_command(
     bool jsonOutput
 )
 {
+    #if defined(_WIN32)
+
     const auto monitors = listMonitors();
     const auto windows = listVisibleWindows();
 
@@ -196,6 +211,20 @@ static int run_list_sources_command(
     printVisibleWindows();
 
     return 0;
+    #else
+
+        if (jsonOutput) {
+            std::cout
+                << "{\"monitors\":[],\"windows\":[]}\n";
+        } else {
+            std::cout
+                << "\nAvailable capture sources:\n"
+                << "\nLinux source enumeration is not implemented yet.\n";
+        }
+
+        return 0;
+
+    #endif
 }
 
 static int run_obs_inventory_command()
@@ -218,7 +247,6 @@ static int run_obs_inventory_command()
             << "[Native Stream Engine] "
             << "failed to initialize OBS\n";
 
-        engine.shutdown();
         return 1;
     }
 
@@ -264,8 +292,20 @@ int main(
     }
 
     if (command == "--list-windows") {
+    #if defined(_WIN32)
+
         printVisibleWindows();
         return 0;
+
+    #else
+
+        std::cerr
+            << "[Native Stream Engine] "
+            << "--list-windows is currently Windows-only\n";
+
+        return 1;
+
+    #endif
     }
 
     if (command == "--list-sources") {

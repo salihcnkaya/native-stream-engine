@@ -1,8 +1,5 @@
 #include "native_service.h"
 
-#define WIN32_LEAN_AND_MEAN
-#include <Windows.h>
-
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -14,14 +11,26 @@
 #include <thread>
 #include <vector>
 
-#include "native_wgc_source.h"
 #include "base64_utils.h"
-#include "image_utils.h"
 #include "obs_engine.h"
+
+#if defined(_WIN32)
+
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+
+#include "native_wgc_source.h"
+#include "image_utils.h"
 #include "wgc_capture.h"
 #include "window_utils.h"
 
-static std::unique_ptr<ObsEngine> g_engine;
+#endif
+
+#if defined(__linux__)
+#include "linux_source_utils.h"
+#endif
+
+static std::shared_ptr<ObsEngine> g_engine;
 
 static std::atomic<bool> g_captureActive = false;
 static std::atomic<bool> g_captureStarting = false;
@@ -32,8 +41,93 @@ static std::atomic<bool> g_serviceRunning = false;
 static std::atomic<bool> g_captureEndedNotified = false;
 
 static std::mutex g_stdoutMutex;
+static std::mutex g_engineLifetimeMutex;
+static std::mutex g_engineLifecycleMutex;
+
+static std::shared_ptr<ObsEngine> get_engine_snapshot()
+{
+    std::lock_guard<std::mutex> lock(
+        g_engineLifetimeMutex
+    );
+
+    return g_engine;
+}
+
+static std::shared_ptr<ObsEngine> take_engine()
+{
+    std::lock_guard<std::mutex> lock(
+        g_engineLifetimeMutex
+    );
+
+    auto engine = std::move(g_engine);
+
+    return engine;
+}
 
 static constexpr uint32_t PICKER_PREVIEW_FRAME_TIMEOUT_MS = 400;
+
+static void reset_capture_target_closed_state()
+{
+#if defined(_WIN32)
+    resetWgcTargetClosed();
+#endif
+}
+
+static bool capture_target_closed()
+{
+#if defined(_WIN32)
+
+    return isWgcTargetClosed();
+
+#elif defined(__linux__)
+
+    const auto engine = get_engine_snapshot();
+
+		if (!engine) {
+				return false;
+		}
+
+		LinuxPortalWindowMatch windowMatch;
+
+		{
+				std::lock_guard<std::mutex> lock(
+						g_engineLifecycleMutex
+				);
+
+				windowMatch =
+						engine->activePortalWindowMatch();
+		}
+
+    if (!windowMatch.valid()) {
+        return false;
+    }
+
+    const LinuxPortalWindowState state =
+        queryLinuxPortalWindowState(
+            windowMatch.uuid
+        );
+
+    if (state == LinuxPortalWindowState::Closed) {
+        std::cerr
+            << "[Native Stream Service] "
+            << "Linux capture target closed"
+            << " uuid="
+            << windowMatch.uuid
+            << " pid="
+            << windowMatch.pid
+            << "\n";
+
+        return true;
+    }
+
+    return false;
+
+#else
+
+    return false;
+
+#endif
+}
 
 static void shutdown_engine_state()
 {
@@ -52,12 +146,17 @@ static void shutdown_engine_state()
         std::memory_order_release
     );
 
-    if (g_engine) {
-        g_engine->shutdown();
-        g_engine.reset();
-    }
+    auto engine = take_engine();
 
-    resetWgcTargetClosed();
+		if (engine) {
+				std::lock_guard<std::mutex> lock(
+						g_engineLifecycleMutex
+				);
+
+				engine->shutdown();
+		}
+
+		reset_capture_target_closed_state();
 
     g_captureEndedNotified.store(
         false,
@@ -82,12 +181,18 @@ static void cleanup_active_capture_state()
         std::memory_order_release
     );
 
-    if (g_engine) {
-        g_engine->stopRtpStreaming();
-        g_engine->clearCapture();
-    }
+    auto engine = get_engine_snapshot();
 
-    resetWgcTargetClosed();
+		if (engine) {
+				std::lock_guard<std::mutex> lock(
+						g_engineLifecycleMutex
+				);
+
+				engine->stopRtpStreaming();
+				engine->clearCapture();
+		}
+
+		reset_capture_target_closed_state();
 
     g_captureEndedNotified.store(
         false,
@@ -114,17 +219,31 @@ static void cleanup_preview_capture_state()
         std::memory_order_release
     );
 
-    if (g_engine) {
-        std::cerr << "[Native Stream DIAG] cleanup_preview_capture_state: before g_engine->clearCapture()\n";
+		auto engine = get_engine_snapshot();
 
-        g_engine->clearCapture();
+		if (engine) {
+				std::cerr
+						<< "[Native Stream DIAG] "
+						<< "cleanup_preview_capture_state: before engine->clearCapture()\n";
 
-        std::cerr << "[Native Stream DIAG] cleanup_preview_capture_state: after g_engine->clearCapture()\n";
-    } else {
-        std::cerr << "[Native Stream DIAG] cleanup_preview_capture_state: g_engine is null, skipping clearCapture\n";
-    }
+				{
+						std::lock_guard<std::mutex> lock(
+								g_engineLifecycleMutex
+						);
 
-    resetWgcTargetClosed();
+						engine->clearCapture();
+				}
+
+				std::cerr
+						<< "[Native Stream DIAG] "
+						<< "cleanup_preview_capture_state: after engine->clearCapture()\n";
+		} else {
+				std::cerr
+						<< "[Native Stream DIAG] "
+						<< "cleanup_preview_capture_state: engine is null, skipping clearCapture\n";
+		}
+
+		reset_capture_target_closed_state();
 
     g_captureEndedNotified.store(
         false,
@@ -138,12 +257,22 @@ static constexpr bool STREAM_DEBUG_NETWORK_FEEDBACK = false;
 
 static std::filesystem::path get_runtime_dir()
 {
+#if defined(_WIN32)
+
     return
         std::filesystem::current_path() /
         "runtime" /
         "OBS-Studio-32.1.2-Windows-x64";
-}
 
+#else
+
+    return
+        std::filesystem::current_path() /
+        "runtime" /
+        "OBS-Studio-32.1.2-Linux-x86_64";
+
+#endif
+}
 
 static std::string json_escape(
     const std::string& value
@@ -284,6 +413,8 @@ static uint64_t extract_uint_value(
     }
 }
 
+#if defined(_WIN32)
+
 static bool wait_for_valid_capture_size(
     uintptr_t hwnd,
     int maxWaitMs,
@@ -331,6 +462,8 @@ static bool wait_for_valid_capture_size(
     return false;
 }
 
+#endif
+
 static void run_capture_target_watcher()
 {
     using namespace std::chrono_literals;
@@ -353,7 +486,7 @@ static void run_capture_target_watcher()
         if (
             captureActive &&
             !alreadyNotified &&
-            isWgcTargetClosed()
+						capture_target_closed()
         ) {
             bool expected = false;
 
@@ -418,12 +551,16 @@ int runNativeService()
         }
 
 				if (line.find("\"type\":\"listSources\"") != std::string::npos) {
+
+						#if defined(_WIN32)
+
 						auto monitors = listMonitors();
 						auto windows = listVisibleWindows();
 
 						std::string response =
 							"{\"id\":" + std::to_string(id) +
 							",\"ok\":true,\"type\":\"sources\",\"monitors\":[";
+
 						for (size_t i = 0; i < monitors.size(); i++) {
 								const auto& m = monitors[i];
 
@@ -459,9 +596,43 @@ int runNativeService()
 								response += "}";
 						}
 
-						response += "]}";
+						response += "],\"audioApps\":[]}";
+
+						#else
+
+						const auto audioApps =
+										listLinuxAudioApplications();
+
+								std::string response =
+										"{\"id\":" + std::to_string(id) +
+										",\"ok\":true,\"type\":\"sources\","
+										"\"monitors\":[],\"windows\":[],\"audioApps\":[";
+
+								for (size_t i = 0; i < audioApps.size(); i++) {
+										const auto& app = audioApps[i];
+
+										if (i > 0) {
+												response += ",";
+										}
+
+										response += "{";
+										response += "\"name\":\"" +
+												json_escape(app.name) + "\",";
+										response += "\"binary\":\"" +
+												json_escape(app.binary) + "\",";
+										response += "\"pid\":" +
+												std::to_string(app.pid) + ",";
+										response += "\"nodeName\":\"" +
+												json_escape(app.nodeName) + "\"";
+										response += "}";
+								}
+
+								response += "]}";
+
+						#endif
 
 						send_json(response);
+
 						continue;
 				}
 
@@ -470,6 +641,19 @@ int runNativeService()
 								"\"type\":\"capturePreview\""
 						) != std::string::npos
 				) {
+
+					#if !defined(_WIN32)
+
+							send_json(
+									"{\"id\":" + std::to_string(id) +
+									",\"ok\":false,"
+									"\"error\":\"capture preview is not implemented on Linux yet\"}"
+							);
+
+							continue;
+
+					#else
+
 						if (
 								g_captureActive.load(
 										std::memory_order_acquire
@@ -488,8 +672,40 @@ int runNativeService()
 								continue;
 						}
 
-						if (g_engine) {
+						const auto existingEngine =
+								get_engine_snapshot();
+
+						if (
+								existingEngine &&
+								existingEngine->isOutputStateUnstable()
+						) {
+								send_json(
+										"{\"id\":" + std::to_string(id) +
+										",\"ok\":false,"
+										"\"error\":\"OBS state is unstable; native service restart required\"}"
+								);
+
+								continue;
+						}
+
+						if (existingEngine) {
 								cleanup_preview_capture_state();
+						}
+
+						const auto cleanedEngine =
+								get_engine_snapshot();
+
+						if (
+								cleanedEngine &&
+								cleanedEngine->isOutputStateUnstable()
+						) {
+								send_json(
+										"{\"id\":" + std::to_string(id) +
+										",\"ok\":false,"
+										"\"error\":\"OBS preview cleanup became unstable; native service restart required\"}"
+								);
+
+								continue;
 						}
 
 						g_captureStarting.store(
@@ -502,7 +718,7 @@ int runNativeService()
 								std::memory_order_release
 						);
 
-						resetWgcTargetClosed();
+						reset_capture_target_closed_state();
 
 						const std::string capture =
 								extract_string_value(
@@ -556,10 +772,14 @@ int runNativeService()
 						} else if (capture == "game") {
 								captureType =
 										CaptureType::Game;
-						} else if (capture == "wgc") {
+						} 
+						#if defined(_WIN32)
+						else if (capture == "wgc") {
 								captureType =
 										CaptureType::Wgc;
-						} else if (capture != "monitor") {
+						} 
+						#endif
+						else if (capture != "monitor") {
 								g_captureStarting.store(
 										false,
 										std::memory_order_release
@@ -628,18 +848,22 @@ int runNativeService()
 						previewVideoConfig.scaleFilter =
 								"bilinear";
 
-							if (!g_engine) {
-									g_engine =
-											std::make_unique<ObsEngine>();
+							auto engine = get_engine_snapshot();
+
+							if (!engine) {
+									engine =
+											std::make_shared<ObsEngine>();
 
 									if (
-											!g_engine->initialize(
+											!engine->initialize(
 													get_runtime_dir(),
 													previewVideoConfig
 											)
 									) {
-											shutdown_engine_state();
-
+										g_captureStarting.store(
+												false,
+												std::memory_order_release
+										);
 											send_json(
 													"{\"id\":" +
 													std::to_string(id) +
@@ -648,10 +872,18 @@ int runNativeService()
 											);
 
 											continue;
+									}		
+
+									{
+											std::lock_guard<std::mutex> lock(
+													g_engineLifetimeMutex
+											);
+
+											g_engine = engine;
 									}
 							} else {
 									if (
-											!g_engine->configureVideo(
+											!engine->configureVideo(
 													previewVideoConfig
 											)
 									) {
@@ -669,7 +901,7 @@ int runNativeService()
 							}
 
 						if (
-								!g_engine->createCaptureScene(
+								!engine->createCaptureScene(
 										captureType,
 										hwnd,
 										0,
@@ -677,6 +909,18 @@ int runNativeService()
 										monitorIndex
 								)
 						) {
+								if (engine->isOutputStateUnstable()) {
+										send_json(
+												"{\"id\":" +
+												std::to_string(id) +
+												",\"ok\":false,"
+												"\"error\":\"preview capture scene failed; OBS state became unstable\"}"
+										);
+
+										shutdown_engine_state();
+										continue;
+								}
+
 								cleanup_preview_capture_state();
 
 								send_json(
@@ -693,7 +937,7 @@ int runNativeService()
 						uint32_t sourceHeight = 0;
 
 						if (
-								!g_engine->waitForCaptureFrame(
+								!engine->waitForCaptureFrame(
 										PICKER_PREVIEW_FRAME_TIMEOUT_MS,
 										sourceWidth,
 										sourceHeight
@@ -714,7 +958,7 @@ int runNativeService()
 						std::vector<uint8_t> sourcePixels;
 
 						if (
-								!g_engine->copyCaptureFrameBgra(
+								!engine->copyCaptureFrameBgra(
 										sourcePixels,
 										sourceWidth,
 										sourceHeight
@@ -894,6 +1138,7 @@ int runNativeService()
 						std::cerr << "[Native Stream DIAG] capturePreview: send_json returned, continuing loop\n";
 
 						continue;
+					#endif
 				}
 
 				if (line.find("\"type\":\"startCapture\"") != std::string::npos) {
@@ -905,9 +1150,68 @@ int runNativeService()
 								);
 								continue;
 						}
-						if (g_engine) {
-							cleanup_active_capture_state();
+
+						std::string quality =
+								extract_string_value(
+										line,
+										"quality",
+										"720p60"
+								);
+
+						const bool validQuality =
+								quality == "720p30" ||
+								quality == "720p60" ||
+								quality == "1080p30" ||
+								quality == "1080p60";
+
+						if (!validQuality) {
+								send_json(
+										"{\"id\":" +
+										std::to_string(id) +
+										",\"ok\":false,"
+										"\"type\":\"captureStartResult\","
+										"\"error\":\"invalid quality\"}"
+								);
+
+								continue;
 						}
+
+						const auto existingEngine =
+								get_engine_snapshot();
+
+						if (
+								existingEngine &&
+								existingEngine->isOutputStateUnstable()
+						) {
+								send_json(
+										"{\"id\":" + std::to_string(id) +
+										",\"ok\":false,"
+										"\"error\":\"OBS state is unstable; native service restart required\"}"
+								);
+
+								continue;
+						}
+
+						if (existingEngine) {
+								cleanup_active_capture_state();
+						}
+
+						const auto cleanedEngine =
+								get_engine_snapshot();
+
+						if (
+								cleanedEngine &&
+								cleanedEngine->isOutputStateUnstable()
+						) {
+								send_json(
+										"{\"id\":" + std::to_string(id) +
+										",\"ok\":false,"
+										"\"error\":\"OBS cleanup became unstable; native service restart required\"}"
+								);
+
+								continue;
+						}
+
 						g_captureStarting.store(
 								true,
 								std::memory_order_release
@@ -923,12 +1227,12 @@ int runNativeService()
 								std::memory_order_release
 						);
 
-						resetWgcTargetClosed();
+						reset_capture_target_closed_state();
 
 						std::string capture = extract_string_value(line, "capture", "monitor");
 						const int monitorIndex = static_cast<int>(extract_uint_value(line, "monitorIndex", 0));
 						std::string audio = extract_string_value(line, "audio", "auto");
-						std::string quality = extract_string_value(line, "quality", "720p60");
+						std::string audioTarget = extract_string_value(line, "audioTarget", "");
 						std::string rtpIp = extract_string_value(line, "rtpIp", "");
 						std::string encoder = extract_string_value(line, "encoder", "auto");
 
@@ -1004,9 +1308,14 @@ int runNativeService()
 								captureType = CaptureType::Window;
 						} else if (capture == "game") {
 								captureType = CaptureType::Game;
-						} else if (capture == "wgc") {
+						} 
+						#if defined(_WIN32)
+						else if (capture == "wgc") {
 								captureType = CaptureType::Wgc;
 						}						
+						#endif
+
+						#if defined(_WIN32)
 
 						if (captureType != CaptureType::Monitor && hwnd == 0) {
 								g_captureStarting.store(
@@ -1022,12 +1331,15 @@ int runNativeService()
 								continue;
 						}
 
+						#endif
+
 						std::thread(
 								[
 										id,
 										capture,
 										monitorIndex,
 										audio,
+										audioTarget,
 										quality,
 										rtpIp,
 										encoder,
@@ -1053,13 +1365,15 @@ int runNativeService()
 										videoConfig.fps = 60;
 										videoConfig.scaleFilter = "lanczos";
 
+										#if defined(_WIN32)
+
 										if (captureType != CaptureType::Monitor && hwnd != 0) {
 												int detectedWidth = 0;
 												int detectedHeight = 0;
 
 												if (!wait_for_valid_capture_size(
 																hwnd,
-																1800000, // 30 dakika - Discord modeli: kullanicinin uygulamaya donmesini genis bir pencerede bekle
+																1800000,
 																750,
 																detectedWidth,
 																detectedHeight,
@@ -1090,7 +1404,9 @@ int runNativeService()
 
 												std::cerr << "[Native Stream Service] detected capture size: "
 																	<< detectedWidth << "x" << detectedHeight << "\n";
-										}						
+										}
+										
+										#endif
 
 										if (quality == "720p30") {
 												videoConfig.outputWidth = 1280;
@@ -1108,14 +1424,6 @@ int runNativeService()
 												videoConfig.outputWidth = 1920;
 												videoConfig.outputHeight = 1080;
 												videoConfig.fps = 60;
-										} else if (quality == "source") {
-												videoConfig.outputWidth = videoConfig.baseWidth;
-												videoConfig.outputHeight = videoConfig.baseHeight;
-												videoConfig.fps = 60;
-										} else {
-												std::cerr << "[Native Stream Service] unknown quality, falling back to 720p60: "
-																	<< quality
-																	<< "\n";
 										}
 
 										if (
@@ -1134,18 +1442,21 @@ int runNativeService()
 												return;
 										}
 
-										if (!g_engine) {
-												g_engine =
-														std::make_unique<ObsEngine>();
+										auto engine = get_engine_snapshot();
+										
+										if (!engine) {
+												engine = std::make_shared<ObsEngine>();
 
 												if (
-														!g_engine->initialize(
+														!engine->initialize(
 																get_runtime_dir(),
 																videoConfig
 														)
 												) {
-														shutdown_engine_state();
-
+													g_captureStarting.store(
+															false,
+															std::memory_order_release
+													);
 														send_json(
 																"{\"id\":" +
 																std::to_string(id) +
@@ -1155,9 +1466,17 @@ int runNativeService()
 
 														return;
 												}
+
+												{
+														std::lock_guard<std::mutex> lock(
+																g_engineLifetimeMutex
+														);
+
+														g_engine = engine;
+												}
 										} else {
 												if (
-														!g_engine->configureVideo(
+														!engine->configureVideo(
 																videoConfig
 														)
 												) {
@@ -1174,7 +1493,7 @@ int runNativeService()
 												}
 										}
 
-										if (!g_engine->createCaptureScene(
+										if (!engine->createCaptureScene(
 														captureType,
 														hwnd,
 														1000,
@@ -1182,21 +1501,42 @@ int runNativeService()
 														monitorIndex
 												)) {
 
+												if (engine->isOutputStateUnstable()) {
+														send_json(
+																"{\"id\":" + std::to_string(id) +
+																",\"ok\":false,\"type\":\"captureStartResult\","
+																"\"error\":\"create capture scene failed; OBS state became unstable\"}"
+														);
+
+														shutdown_engine_state();
+														return;
+												}
+
 												cleanup_active_capture_state();
+
 												send_json(
 														"{\"id\":" + std::to_string(id) +
 														",\"ok\":false,\"type\":\"captureStartResult\","
 														"\"error\":\"create capture scene failed\"}"
 												);
+
 												return;
 										}
 
 										uint32_t captureFrameWidth = 0;
 										uint32_t captureFrameHeight = 0;
 
+										#if defined(_WIN32)
+												constexpr int CAPTURE_FRAME_TIMEOUT_MS = 3000;
+										#elif defined(__linux__)
+												constexpr int CAPTURE_FRAME_TIMEOUT_MS = 180000;
+										#else
+												constexpr int CAPTURE_FRAME_TIMEOUT_MS = 3000;
+										#endif
+
 										if (
-												!g_engine->waitForCaptureFrame(
-														3000,
+												!engine->waitForCaptureFrame(
+														CAPTURE_FRAME_TIMEOUT_MS,
 														captureFrameWidth,
 														captureFrameHeight,
 														&g_cancelRequested
@@ -1230,7 +1570,7 @@ int runNativeService()
 												<< captureFrameHeight
 												<< "\n";
 
-										const bool audioStreamingEnabled =
+										bool audioStreamingEnabled =
 														audioRtpEnabled &&
 														audio != "none";
 
@@ -1242,33 +1582,51 @@ int runNativeService()
 																		<< "audio capture disabled\n";
 										} else if (audio == "desktop") {
 														audioOk =
-																		g_engine->createDesktopAudioSource();
+																		engine->createDesktopAudioSource();
 										} else if (audio == "process") {
 														audioOk =
-																		g_engine->createProcessAudioSource(hwnd);
+																		engine->createProcessAudioSource(hwnd, audioTarget);
 										} else {
 														if (captureType == CaptureType::Monitor) {
-																audioOk =
-																				g_engine->createDesktopAudioSource();
+																		audioOk =
+																						engine->createDesktopAudioSource();
 														} else {
-																audioOk =
-																				g_engine->createProcessAudioSource(hwnd);
+																		audioOk =
+																						engine->createProcessAudioSource(hwnd, audioTarget);
 
-																if (!audioOk) {
-																				audioOk =
-																								g_engine->createDesktopAudioSource();
-																}
+																		#if defined(_WIN32)
+																		if (!audioOk) {
+																						audioOk =
+																										engine->createDesktopAudioSource();
+																		}
+																		#endif
 														}
 										}
 
+										#if defined(__linux__)
+										if (
+														!audioOk &&
+														audio == "auto" &&
+														captureType != CaptureType::Monitor
+										) {
+														std::cerr
+																		<< "[Native Stream Service] "
+																		<< "application audio unavailable; "
+																		<< "continuing video-only\n";
+
+														audioStreamingEnabled = false;
+														audioOk = true;
+										}
+										#endif
+
 										if (!audioOk) {
-												cleanup_active_capture_state();
-												send_json(
-														"{\"id\":" + std::to_string(id) +
-														",\"ok\":false,\"type\":\"captureStartResult\","
-														"\"error\":\"create audio source failed\"}"
-												);
-												return;
+														cleanup_active_capture_state();
+														send_json(
+																		"{\"id\":" + std::to_string(id) +
+																		",\"ok\":false,\"type\":\"captureStartResult\","
+																		"\"error\":\"create audio source failed\"}"
+														);
+														return;
 										}
 
 										if (
@@ -1288,7 +1646,7 @@ int runNativeService()
 										}
 
 										if (rtpEnabled) {
-												int bitrate = 6000;
+												int bitrate = 4500;
 
 												if (quality == "720p30") {
 														bitrate = 2500;
@@ -1296,13 +1654,11 @@ int runNativeService()
 														bitrate = 4500;
 												} else if (quality == "1080p30") {
 														bitrate = 5500;
-												} else if (quality == "1080p60" || quality == "source") {
+												} else if (quality == "1080p60") {
 														bitrate = 8000;
-												} else {
-														bitrate = 4500;
 												}
 
-												if (!g_engine->startRtpStreaming(
+												if (!engine->startRtpStreaming(
 																rtpIp,
 																rtpPort,
 																payloadType,
@@ -1390,8 +1746,10 @@ int runNativeService()
 								extract_uint_value(line, "targetBitrateBps", 0)
 						);
 
+						auto engine = get_engine_snapshot();
+
 						if (
-									!g_engine ||
+									!engine ||
 									!g_captureActive.load(
 											std::memory_order_acquire
 									)
@@ -1414,7 +1772,7 @@ int runNativeService()
 						}
 
 						const bool applied =
-								g_engine->setTargetBitrate(targetBitrateBps);
+								engine->setTargetBitrate(targetBitrateBps);
 
 						send_json(
 								"{\"id\":" + std::to_string(id) +
@@ -1438,6 +1796,10 @@ int runNativeService()
 						feedback.jitterMs = static_cast<uint32_t>(
 								extract_uint_value(line, "jitterMs", 0)
 						);
+
+						feedback.hasRtt =
+								line.find("\"hasRtt\":true") !=
+								std::string::npos;
 
 						feedback.rttMs = static_cast<uint32_t>(
 								extract_uint_value(line, "rttMs", 0)
@@ -1486,8 +1848,10 @@ int runNativeService()
 
 						feedback.hasFeedback = true;
 
+						auto engine = get_engine_snapshot();
+
 						if (
-									!g_engine ||
+									!engine ||
 									!g_captureActive.load(
 											std::memory_order_acquire
 									)
@@ -1500,12 +1864,13 @@ int runNativeService()
 								continue;
 						}
 
-						g_engine->updateNetworkFeedback(feedback);
+						engine->updateNetworkFeedback(feedback);
 
 						if (STREAM_DEBUG_NETWORK_FEEDBACK) {
 								std::cerr << "[Native Stream Service] network feedback"
 													<< " loss=" << feedback.packetLossRatio
 													<< " jitterMs=" << feedback.jitterMs
+													<< " hasRtt=" << (feedback.hasRtt ? "yes" : "no")
 													<< " rttMs=" << feedback.rttMs
 													<< " score=" << feedback.score
 													<< " bitrate=" << feedback.bitrateBps
@@ -1537,6 +1902,10 @@ int runNativeService()
 								extract_uint_value(line, "jitterMs", 0)
 						);
 
+						feedback.hasRtt =
+								line.find("\"hasRtt\":true") !=
+								std::string::npos;
+
 						feedback.rttMs = static_cast<uint32_t>(
 								extract_uint_value(line, "rttMs", 0)
 						);
@@ -1547,13 +1916,15 @@ int runNativeService()
 
 						feedback.hasFeedback = true;
 
+						auto engine = get_engine_snapshot();
+
 						if (
-									g_engine &&
+									engine &&
 									g_captureActive.load(
 											std::memory_order_acquire
 									)
 							) {
-								g_engine->updateNetworkFeedback(feedback);
+								engine->updateNetworkFeedback(feedback);
 						}
 
 						send_json(

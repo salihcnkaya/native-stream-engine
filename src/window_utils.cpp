@@ -158,9 +158,6 @@ static BOOL CALLBACK enumWindowsProc(HWND hwnd, LPARAM lParam)
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
 
-    // const std::string exeName =
-    //     getExeNameFromPid(pid);
-
     const std::string exePath =
         getExePathFromPid(pid);
 
@@ -241,7 +238,6 @@ bool findWindowByHwnd(uintptr_t hwndValue, WindowInfo& out)
     out.pid = static_cast<uint32_t>(pid);
     out.title = getWindowTextUtf8(hwnd);
     out.className = getClassNameUtf8(hwnd);
-    // out.exeName = getExeNameFromPid(pid);
     out.exePath = getExePathFromPid(pid);
     out.exeName = getExeNameFromPath(out.exePath);
 
