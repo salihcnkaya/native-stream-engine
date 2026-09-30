@@ -1,528 +1,657 @@
 # Building native-stream-engine
 
-This document explains how to build `native-stream-engine` from source on Windows.
+This guide describes the current production build workflow for **Windows and Linux**.
 
-## Supported environment
+The project no longer uses the old manual `obs.def` / `make-obs-import-lib.ps1` workflow. OBS Studio is built from a pinned upstream source revision by platform-specific scripts in this repository.
 
-The current implementation supports:
+---
 
-- Windows 10 or Windows 11
-- x64 architecture
-- Microsoft Visual C++
-- CMake 3.24 or newer
-- C++17
-- OBS Studio 32.1.2
+## 1. Pinned OBS revision
 
-Other operating systems, CPU architectures, OBS versions, and compiler toolchains are not currently supported.
+Both runtime scripts build:
 
-## Requirements
+```text
+OBS Studio 32.1.2
+```
 
-Install the following components before building:
+and verify the exact commit:
 
-- Visual Studio with Microsoft C++ build tools
-- Desktop development with C++ workload
-- MSVC x64 compiler and linker
-- Windows 10 or Windows 11 SDK
-- CMake 3.24 or newer
-- PowerShell 5.1 or newer
-- Git, when cloning the repository from a remote source
+```text
+fb4d98bf88fae5fc85cb11fc57f7c5e309282194
+```
 
-Visual Studio 2022 or newer is recommended.
+If the tag resolves to another commit, the scripts stop.
 
-The project must be configured for the x64 architecture.
+OBS source is cloned into temporary local build directories and is not vendored into Git.
 
-## Local repository layout
+---
 
-After downloading the required OBS files, the expected local layout is:
+## 2. Repository layout
+
+Relevant tracked files:
 
 ```text
 native-stream-engine/
 ├── compatibility/
 │   └── obs-32.1.2/
-│       ├── obs.def
 │       ├── obs.lib
 │       └── obsconfig.h
-├── deps/
-│   └── obs-studio-32.1.2/
-├── runtime/
-│   └── OBS-Studio-32.1.2-Windows-x64/
+├── docs/
+├── patches/
+│   └── obs/
+│       ├── common-nvenc-lightweight-reconfig.patch
+│       ├── common-qsv-skip-noop-reconfig.patch
+│       ├── linux-pipewire-expose-restore-token.patch
+│       └── README.md
 ├── scripts/
-│   └── make-obs-import-lib.ps1
+│   ├── build-obs-linux-runtime.sh
+│   └── build-obs-windows-runtime.ps1
 ├── src/
 ├── CMakeLists.txt
-├── BUILDING.md
 ├── COPYRIGHT
 ├── LICENSE
 └── README.md
 ```
 
-The following directories are intentionally excluded from Git:
+Generated runtime directories:
 
 ```text
-build/
-deps/
-runtime/
-```
-
-They contain generated outputs or locally installed dependencies.
-
-## OBS Studio source files
-
-Download the OBS Studio 32.1.2 source archive.
-
-Extract the source tree into:
-
-```text
-deps/obs-studio-32.1.2/
-```
-
-After extraction, this file must exist:
-
-```text
-deps/obs-studio-32.1.2/libobs/obs.h
-```
-
-The archive must not create an additional nested source directory.
-
-Correct:
-
-```text
-deps/obs-studio-32.1.2/libobs/obs.h
-```
-
-Incorrect:
-
-```text
-deps/obs-studio-32.1.2/obs-studio-32.1.2/libobs/obs.h
-```
-
-The source tree is used for the libobs headers required during compilation.
-
-This project does not compile the complete OBS Studio source tree.
-
-## OBS Studio Windows runtime
-
-Download the OBS Studio 32.1.2 Windows x64 runtime archive.
-
-Extract it into:
-
-```text
-runtime/OBS-Studio-32.1.2-Windows-x64/
-```
-
-After extraction, this file must exist:
-
-```text
-runtime/OBS-Studio-32.1.2-Windows-x64/bin/64bit/obs.dll
-```
-
-The expected runtime layout includes:
-
-```text
-runtime/OBS-Studio-32.1.2-Windows-x64/
-├── bin/
-│   └── 64bit/
-├── data/
-└── obs-plugins/
-    └── 64bit/
-```
-
-The OBS runtime provides the DLLs, plugins, effects, locale files, and other data required while the engine is running.
-
-## OBS compatibility layer
-
-The repository includes a compatibility layer for OBS Studio 32.1.2:
-
-```text
-compatibility/obs-32.1.2/
-├── obs.def
-├── obs.lib
-└── obsconfig.h
-```
-
-### obs.def
-
-`obs.def` contains the exported libobs symbols currently required by the engine.
-
-The export list is intentionally explicit and minimal. It should not automatically contain every export exposed by `obs.dll`.
-
-When the engine starts using an additional libobs function, the corresponding exported symbol must be added manually to `obs.def`.
-
-### obs.lib
-
-`obs.lib` is an x64 import library generated from `obs.def`.
-
-A verified copy is included in the repository so that normal builds do not require import-library regeneration.
-
-### obsconfig.h
-
-`obsconfig.h` supplies configuration definitions required by the OBS headers used by this project.
-
-## Regenerating obs.lib
-
-Regeneration is only required when:
-
-- `obs.def` is changed
-- the engine starts using another libobs export
-- `obs.lib` is missing
-- the compatibility layer is intentionally rebuilt
-
-Open:
-
-```text
-Developer PowerShell for Visual Studio
-```
-
-Change to the repository root and run:
-
-```powershell
-.\scripts\make-obs-import-lib.ps1
-```
-
-The script reads:
-
-```text
-compatibility/obs-32.1.2/obs.def
-```
-
-and generates:
-
-```text
-compatibility/obs-32.1.2/obs.lib
-```
-
-The generated import library targets x64.
-
-The script uses the Microsoft Library Manager:
-
-```text
-lib.exe
-```
-
-For that reason, it must be run from a Visual Studio developer terminal or another environment where `lib.exe` is available.
-
-Do not regenerate `obs.def` automatically from every export in `obs.dll`. The compatibility surface should remain controlled and limited to the symbols actually used by the engine.
-
-## Configure the project
-
-Open PowerShell or Developer PowerShell in the repository root.
-
-Configure a Visual Studio x64 build:
-
-```powershell
-cmake -S . -B build -A x64
-```
-
-The default dependency paths are:
-
-```text
-deps/obs-studio-32.1.2
 runtime/OBS-Studio-32.1.2-Windows-x64
-compatibility/obs-32.1.2
+runtime/OBS-Studio-32.1.2-Linux-x86_64
 ```
 
-During configuration, CMake verifies that the required OBS source, runtime, import library, and compatibility header are present.
+These runtimes are local/generated artifacts and should not be committed.
 
-If one of these dependencies is missing, configuration stops with an error describing the expected path.
+---
 
-## Build the engine
+# Windows
 
-Build the Release configuration:
+## 3. Windows requirements
+
+Required:
+
+- Windows x64
+- Visual Studio 2022 C++ build tools
+- MSVC
+- Windows SDK
+- CMake
+- Git
+- PowerShell
+
+The runtime builder uses the Visual Studio 2022 x64 generator.
+
+---
+
+## 4. Build the pinned Windows OBS runtime
+
+From the repository root:
 
 ```powershell
-cmake --build build --config Release
+.\scripts\build-obs-windows-runtime.ps1
 ```
 
-The engine executable is generated at:
-
-```text
-build/Release/native-stream-engine.exe
-```
-
-As part of the post-build step, the contents of:
-
-```text
-runtime/OBS-Studio-32.1.2-Windows-x64/bin/64bit
-```
-
-are copied into:
-
-```text
-build/Release/
-```
-
-This places `obs.dll` and the other required runtime binaries next to the executable.
-
-## Run the engine
-
-Run the Release build from the repository root:
+If script execution policy blocks local scripts:
 
 ```powershell
-.\build\Release\native-stream-engine.exe
+powershell -ExecutionPolicy Bypass -File .\scripts\build-obs-windows-runtime.ps1
 ```
 
-The engine uses standard input and standard output for communication with its host process.
+### What the script does
 
-Commands and events use line-delimited JSON.
+The script:
 
-Each JSON message must be written on a single line and terminated with a newline character.
+1. removes/recreates its temporary OBS working tree,
+2. shallow-clones OBS Studio 32.1.2 with required submodules,
+3. verifies commit `fb4d98bf88fae5fc85cb11fc57f7c5e309282194`,
+4. applies:
+   - `common-*.patch`
+   - `windows-*.patch`
+5. restricts the OBS plugin/build graph to the modules needed by native-stream-engine,
+6. configures a Visual Studio 2022 x64 OBS build,
+7. builds the selected OBS/libobs/plugin/helper targets,
+8. uses OBS runtime staging/dependency bundling,
+9. publishes the runtime,
+10. publishes the official libobs import library and generated `obsconfig.h`.
 
-## Basic smoke test
+Default selected target set includes:
 
-After starting the engine, send a ping request through standard input:
-
-```json
-{ "id": "smoke-1", "command": "ping" }
+```text
+libobs
+libobs-d3d11
+win-capture
+win-wasapi
+obs-ffmpeg
+obs-ffmpeg-mux
+obs-x264
+obs-qsv11
+obs-qsv-test
+obs-nvenc
+obs-nvenc-test
+nse-runtime-stage
 ```
 
-The engine should return a response associated with the same request ID and confirm that it is alive.
+### Output
 
-After the ping test, send the shutdown command supported by the engine protocol.
+Runtime:
 
-The process should exit cleanly without remaining active in the background.
+```text
+runtime/OBS-Studio-32.1.2-Windows-x64/
+```
 
-A successful basic verification consists of:
+Compatibility files:
 
-- CMake configuration completes
-- Release build completes
-- `native-stream-engine.exe` is generated
-- `obs.dll` is copied beside the executable
-- the engine starts successfully
-- the ping request receives a pong response
-- the shutdown request terminates the process cleanly
+```text
+compatibility/obs-32.1.2/obs.lib
+compatibility/obs-32.1.2/obsconfig.h
+```
 
-## Verify generated files
+The compatibility files are generated from the same pinned OBS build used to create the runtime.
 
-Confirm that the executable exists:
+### Important
+
+Do **not** recreate the old workflow:
+
+```text
+compatibility/obs-32.1.2/obs.def
+scripts/make-obs-import-lib.ps1
+scripts/build-patched-obs-plugins.ps1
+```
+
+Those files/workflows are obsolete.
+
+No manual patched-DLL replacement is required.
+
+---
+
+## 5. Configure the Windows engine
+
+After the runtime exists:
 
 ```powershell
-Test-Path .\build\Release\native-stream-engine.exe
+cmake -S . -B build-windows-test -G "Visual Studio 17 2022" -A x64
 ```
 
-Expected result:
+CMake checks for:
 
 ```text
-True
+runtime/OBS-Studio-32.1.2-Windows-x64/bin/64bit/obs.dll
+compatibility/obs-32.1.2/obs.lib
+compatibility/obs-32.1.2/obsconfig.h
 ```
 
-Confirm that the OBS runtime DLL was copied:
+Configuration fails with an explicit error when a required item is missing.
+
+---
+
+## 6. Build Windows Release
 
 ```powershell
-Test-Path .\build\Release\obs.dll
+cmake --build build-windows-test --config Release -j
 ```
 
-Expected result:
+Expected executable:
 
 ```text
-True
+build-windows-test/Release/native-stream-engine.exe
 ```
 
-Confirm that the OBS import library exists:
+The post-build step copies required Windows OBS runtime content next to the executable, including:
+
+```text
+bin/64bit runtime files
+obs-plugins/
+data/
+```
+
+---
+
+## 7. Windows smoke test
+
+Run from the repository root so the engine's runtime lookup can resolve the repository `runtime/` directory:
 
 ```powershell
-Test-Path .\compatibility\obs-32.1.2\obs.lib
+.\build-windows-test\Release\native-stream-engine.exe --list
 ```
 
-Expected result:
+A successful run should initialize the pinned OBS runtime, enumerate loaded modules/encoders, shut down, and return normally.
 
-```text
-True
-```
-
-## Clean build
-
-To remove the existing build output:
+Other useful commands:
 
 ```powershell
-Remove-Item .\build -Recurse -Force -ErrorAction SilentlyContinue
+.\build-windows-test\Release\native-stream-engine.exe --list-windows
+
+.\build-windows-test\Release\native-stream-engine.exe --list-sources --json 1
+
+.\build-windows-test\Release\native-stream-engine.exe --service
 ```
 
-Configure and build again:
+---
+
+# Linux
+
+## 8. Linux requirements
+
+The engine currently targets Linux x86_64.
+
+The Linux engine build directly requires development packages for:
+
+- Qt6 Core
+- Qt6 DBus
+- GLib / GIO
+- PipeWire
+
+The OBS runtime build additionally needs the dependencies required by the selected OBS 32.1.2 modules.
+
+Build tools used by the runtime script include:
+
+- Bash
+- Git
+- CMake
+- Ninja
+- `patchelf`
+
+The OBS and third-party module builds may require additional compiler/system development packages supplied by the Linux distribution.
+
+---
+
+## 9. Build the pinned Linux OBS runtime
+
+Ensure the script is executable:
+
+```bash
+chmod +x scripts/build-obs-linux-runtime.sh
+```
+
+Run:
+
+```bash
+./scripts/build-obs-linux-runtime.sh
+```
+
+### Runtime builder pins
+
+OBS:
+
+```text
+32.1.2
+fb4d98bf88fae5fc85cb11fc57f7c5e309282194
+```
+
+PipeWire application-audio plugin:
+
+```text
+obs-pipewire-audio-capture 1.2.1
+```
+
+### What the script does
+
+The script:
+
+1. deletes/recreates `.obs-build-tmp-linux`,
+2. clones OBS Studio 32.1.2 with submodules,
+3. verifies the exact OBS commit,
+4. applies:
+   - `common-*.patch`
+   - `linux-*.patch`
+5. replaces the OBS plugin graph with the minimal native-stream-engine set,
+6. configures OBS with Ninja/Release,
+7. builds the selected OBS targets,
+8. clones and builds `obs-pipewire-audio-capture`,
+9. assembles the Linux runtime directory,
+10. copies libobs and graphics libraries,
+11. copies required plugins and plugin data,
+12. copies libobs public headers and generated `obsconfig.h`,
+13. fixes runtime RPATH/RUNPATH values with `patchelf`.
+
+Selected OBS target set:
+
+```text
+libobs
+libobs-opengl
+obs-nvenc
+obs-nvenc-test
+obs-qsv11
+obs-ffmpeg
+obs-x264
+linux-pipewire
+linux-pulseaudio
+```
+
+Additional application-audio plugin:
+
+```text
+linux-pipewire-audio.so
+```
+
+### Output
+
+```text
+runtime/OBS-Studio-32.1.2-Linux-x86_64/
+```
+
+Expected high-level layout:
+
+```text
+runtime/OBS-Studio-32.1.2-Linux-x86_64/
+├── bin/
+│   └── obs-nvenc-test
+├── data/
+├── include/
+│   └── obsconfig.h
+├── lib/
+│   ├── libobs.so...
+│   └── libobs-opengl.so...
+└── obs-plugins/
+    ├── linux-pipewire.so
+    ├── linux-pulseaudio.so
+    ├── linux-pipewire-audio.so
+    ├── obs-ffmpeg.so
+    ├── obs-nvenc.so
+    ├── obs-qsv11.so
+    └── obs-x264.so
+```
+
+---
+
+## 10. Configure the Linux engine
+
+```bash
+cmake -S . -B build-linux-nodeps-test -DCMAKE_BUILD_TYPE=Release
+```
+
+CMake requires:
+
+```text
+runtime/OBS-Studio-32.1.2-Linux-x86_64/include/obsconfig.h
+runtime/OBS-Studio-32.1.2-Linux-x86_64/lib/libobs.so
+```
+
+and resolves:
+
+```text
+Qt6::Core
+Qt6::DBus
+glib-2.0
+gio-2.0
+libpipewire-0.3
+```
+
+The build uses the generated OBS runtime headers directly.
+
+---
+
+## 11. Build Linux Release
+
+```bash
+cmake --build build-linux-nodeps-test -j"$(nproc)"
+```
+
+Expected executable:
+
+```text
+build-linux-nodeps-test/native-stream-engine
+```
+
+The Linux post-build step also copies:
+
+```text
+obs-nvenc-test
+```
+
+next to the executable.
+
+The build target is configured with an RPATH pointing at the generated OBS runtime `lib` directory for the local build.
+
+---
+
+## 12. Linux smoke test
+
+From the repository root:
+
+```bash
+./build-linux-nodeps-test/native-stream-engine --list
+```
+
+A successful inventory run should:
+
+- initialize libobs,
+- load the selected Linux modules,
+- enumerate encoders,
+- shut down normally.
+
+Useful service command:
+
+```bash
+./build-linux-nodeps-test/native-stream-engine --service
+```
+
+Linux source-enumeration note:
+
+```bash
+./build-linux-nodeps-test/native-stream-engine --list-sources --json 1
+```
+
+currently returns empty source arrays because Linux pre-capture enumeration is not implemented. PipeWire portal source selection occurs during capture creation.
+
+---
+
+# Shared build notes
+
+## 13. OBS patches
+
+Current patches:
+
+```text
+patches/obs/common-nvenc-lightweight-reconfig.patch
+patches/obs/common-qsv-skip-noop-reconfig.patch
+patches/obs/linux-pipewire-expose-restore-token.patch
+```
+
+Patch application is deterministic:
+
+- each matching patch is checked with `git apply --check`,
+- the script fails if a patch no longer applies,
+- common patches are applied on both platforms,
+- platform-specific patches are only applied to the matching platform.
+
+See:
+
+```text
+patches/obs/README.md
+```
+
+for behavior details.
+
+---
+
+## 14. Cleaning engine builds
+
+Windows:
 
 ```powershell
-cmake -S . -B build -A x64
-
-cmake --build build --config Release
+Remove-Item -Recurse -Force build-windows-test -ErrorAction SilentlyContinue
 ```
 
-A clean build should be used after:
+Linux:
 
-- changing CMake configuration
-- changing compiler options
-- replacing the OBS compatibility library
-- changing dependency paths
-- upgrading Visual Studio or the Windows SDK
-- encountering stale linker or generated-project errors
-
-## Custom dependency paths
-
-The default dependency locations may be overridden during CMake configuration.
-
-Example:
-
-```powershell
-cmake -S . -B build -A x64 `
-    -DOBS_SOURCE_DIR="C:\path\to\obs-source" `
-    -DOBS_RUNTIME_DIR="C:\path\to\obs-runtime" `
-    -DOBS_COMPATIBILITY_DIR="C:\path\to\obs-compatibility"
+```bash
+rm -rf build-linux-nodeps-test
 ```
 
-Absolute paths are recommended when overriding the defaults.
+Reconfigure after significant CMake/runtime changes.
 
-The custom OBS source directory must contain:
+---
+
+## 15. Cleaning/rebuilding OBS runtimes
+
+The platform scripts manage their own temporary OBS source/build directories.
+
+Windows default temporary directory:
 
 ```text
-libobs/obs.h
+.obs-build-tmp
 ```
 
-The custom runtime directory must contain:
+Linux default temporary directory:
 
 ```text
-bin/64bit/obs.dll
+.obs-build-tmp-linux
 ```
 
-The custom compatibility directory must contain:
+The scripts rebuild the platform runtime from the pinned source rather than relying on an arbitrary system OBS installation.
+
+---
+
+## 16. Runtime lookup when running the engine
+
+`main.cpp` resolves the platform runtime relative to the current working directory:
+
+Windows:
 
 ```text
-obs.def
-obs.lib
-obsconfig.h
+runtime/OBS-Studio-32.1.2-Windows-x64
 ```
 
-## Troubleshooting
-
-### OBS source was not found
-
-Verify that the following file exists:
+Linux:
 
 ```text
-deps/obs-studio-32.1.2/libobs/obs.h
+runtime/OBS-Studio-32.1.2-Linux-x86_64
 ```
 
-Check whether the source archive was extracted into an extra nested directory.
+For repository smoke tests, run commands from the repository root.
 
-### OBS runtime was not found
+Packaged desktop deployments may place the runtime according to the host application's packaging/preparation workflow; that workflow is outside this repository's CMake build itself.
 
-Verify that the following file exists:
+---
+
+## 17. Common Windows failures
+
+### OBS runtime not found
+
+Error references:
 
 ```text
 runtime/OBS-Studio-32.1.2-Windows-x64/bin/64bit/obs.dll
 ```
 
-Make sure the Windows x64 runtime package was downloaded rather than only the OBS source archive.
+Fix:
 
-### obs.lib was not found
+```powershell
+.\scripts\build-obs-windows-runtime.ps1
+```
 
-The repository normally includes:
+### OBS import library not found
+
+Expected:
 
 ```text
 compatibility/obs-32.1.2/obs.lib
 ```
 
-If the file is missing, regenerate it from a Visual Studio developer terminal:
+Rebuild the Windows OBS runtime. Do not recreate the removed `obs.def` workflow.
 
-```powershell
-.\scripts\make-obs-import-lib.ps1
-```
+### OBS compatibility header not found
 
-### lib.exe was not found
-
-Run the import-library script from:
+Expected:
 
 ```text
-Developer PowerShell for Visual Studio
+compatibility/obs-32.1.2/obsconfig.h
 ```
 
-Also verify that the Visual Studio C++ build tools are installed.
+Rebuild the Windows OBS runtime.
 
-### Unresolved external symbol
+---
 
-An unresolved libobs symbol may indicate that the required function is not listed in:
+## 18. Common Linux failures
+
+### `libobs.so` or `obsconfig.h` missing
+
+Run:
+
+```bash
+./scripts/build-obs-linux-runtime.sh
+```
+
+### Qt6 / DBus missing
+
+CMake's `find_package(Qt6 COMPONENTS Core DBus)` failed. Install the distribution's Qt6 development packages providing Core and DBus.
+
+### GLib / GIO missing
+
+CMake resolves them through `pkg-config`.
+
+Required pkg-config modules:
+
+```text
+glib-2.0
+gio-2.0
+```
+
+### PipeWire development package missing
+
+Required pkg-config module:
+
+```text
+libpipewire-0.3
+```
+
+### `patchelf` missing
+
+The Linux runtime builder requires `patchelf` to make the assembled runtime relocatable.
+
+---
+
+## 19. Verification before committing/releasing build changes
+
+At minimum verify the platform being changed.
+
+### Windows
+
+```powershell
+.\scripts\build-obs-windows-runtime.ps1
+
+Remove-Item -Recurse -Force build-windows-test -ErrorAction SilentlyContinue
+
+cmake -S . -B build-windows-test -G "Visual Studio 17 2022" -A x64
+cmake --build build-windows-test --config Release -j
+
+.\build-windows-test\Release\native-stream-engine.exe --list
+```
+
+### Linux
+
+```bash
+./scripts/build-obs-linux-runtime.sh
+
+rm -rf build-linux-nodeps-test
+
+cmake -S . -B build-linux-nodeps-test -DCMAKE_BUILD_TYPE=Release
+cmake --build build-linux-nodeps-test -j"$(nproc)"
+
+./build-linux-nodeps-test/native-stream-engine --list
+```
+
+For media/transport changes, `--list` alone is not sufficient. Run the relevant capture, audio, RTP, bitrate, and network regression tests before release.
+
+---
+
+## 20. Files that should not return
+
+The following belong to the superseded build workflow and should not be reintroduced:
 
 ```text
 compatibility/obs-32.1.2/obs.def
+scripts/make-obs-import-lib.ps1
+scripts/build-patched-obs-plugins.ps1
+patches/obs/nvenc-lightweight-reconfig.patch
+patches/obs/qsv-skip-noop-reconfig.patch
 ```
 
-Verify that the symbol is exported by the exact `obs.dll` version used by the project.
+The patch replacements are:
 
-Add only the required exported symbol to `obs.def`, regenerate `obs.lib`, delete the existing `build` directory, and perform a clean build.
-
-### Duplicate symbol or invalid import-library errors
-
-Do not generate the compatibility library from an unfiltered list of every export in `obs.dll`.
-
-Use the controlled `obs.def` file included with the repository.
-
-After correcting `obs.def`, regenerate `obs.lib` and perform a clean build.
-
-### DLL was not found when starting the engine
-
-Confirm that the post-build copy completed successfully:
-
-```powershell
-Test-Path .\build\Release\obs.dll
+```text
+patches/obs/common-nvenc-lightweight-reconfig.patch
+patches/obs/common-qsv-skip-noop-reconfig.patch
 ```
 
-If the DLL is missing, verify the configured OBS runtime path and perform a clean Release build.
-
-### OBS plugin could not be loaded
-
-OBS plugins may depend on:
-
-- additional DLLs
-- plugin data directories
-- locale files
-- graphics resources
-- helper executables
-
-Confirm that the required OBS runtime files are available to the engine or embedding application.
-
-The current CMake post-build step copies the contents of `bin/64bit`. Additional plugin and data directories may still be required by the final packaged application.
-
-### The engine starts but capture initialization fails
-
-Verify that:
-
-- the OBS runtime version is exactly 32.1.2
-- the source headers and runtime come from the same OBS version
-- `obs.lib` was generated for x64
-- the Windows SDK is installed
-- the process has access to the required OBS plugin and data directories
-- the selected capture target still exists
-- the graphics adapter and driver support the requested capture and encoding path
-
-### The process does not shut down
-
-Send the protocol shutdown request and wait for the process to exit normally.
-
-The host application should not terminate the process forcibly unless graceful shutdown has failed.
-
-During development, verify that no `native-stream-engine.exe` process remains after the shutdown response.
-
-## Version compatibility
-
-The current compatibility files, source paths, runtime paths, and tested build configuration target OBS Studio 32.1.2.
-
-Using a different OBS version without updating the compatibility layer may result in:
-
-- missing exports
-- linker failures
-- binary incompatibility
-- plugin loading failures
-- changed libobs APIs
-- runtime initialization failures
-- crashes
-
-Do not replace only the OBS runtime or only the OBS source tree with another version.
-
-The source headers, runtime files, and compatibility layer must be treated as one versioned set.
-
-## Distribution note
-
-The local `runtime` directory is not committed to the repository.
-
-A packaged application or release must provide all OBS runtime files required by the enabled capture and encoding features.
-
-Building the executable successfully does not by itself guarantee that a separately packaged copy contains every required OBS plugin, data file, locale resource, or helper executable.
-
-Runtime packaging should therefore be tested independently from the source build.
+and runtime construction is handled by the two current platform scripts.

@@ -1,827 +1,586 @@
 # native-stream-engine
 
-![Platform](https://img.shields.io/badge/platform-Windows-blue)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue)
 ![Language](https://img.shields.io/badge/C%2B%2B-17-blue)
 ![Build](https://img.shields.io/badge/build-CMake-green)
-![License](https://img.shields.io/badge/license-GPL--2.0-red)
+![License](https://img.shields.io/badge/license-GPL--2.0--or--later-red)
 ![libobs](https://img.shields.io/badge/libobs-32.1.2-orange)
 
-High-performance native screen capture and RTP streaming engine built on top of libobs.
+High-performance native capture, encoding, and RTP streaming engine built on top of libobs.
 
-`native-stream-engine` is a Windows-native streaming backend designed for real-time communication applications.
+`native-stream-engine` is a standalone native media service for low-latency desktop/application streaming. It is designed to be launched by a desktop host such as Electron and controlled through line-delimited JSON over standard input/output.
 
-Originally developed as the native streaming component of a Discord-style communication platform, it provides a lightweight service capable of capturing Windows applications, encoding video using hardware-accelerated H.264 encoders, streaming media over RTP, adapting bitrate to changing network conditions, and exposing a simple JSON-based IPC interface suitable for Electron or other desktop applications.
-
-The project focuses on low-latency screen streaming while keeping the host application independent from OBS Studio internals. Communication between the host process and the engine is performed through line-delimited JSON messages over standard input and standard output, allowing the engine to run as a standalone background service.
+The current production implementation supports **Windows and Linux** with platform-specific capture/audio backends while sharing the same OBS, encoder, RTP, pacing, bitrate-control, and service layers.
 
 > [!NOTE]
-> This project currently targets Windows only and is designed to be embedded into desktop applications through a lightweight JSON IPC interface.
-
----
-
-## Table of Contents
-
-- [Features](#features)
-- [Why native-stream-engine?](#why-native-stream-engine)
-- [Architecture](#architecture)
-- [Repository Structure](#repository-structure)
-- [Supported Platform](#supported-platform)
-- [Design Goals](#design-goals)
-- [Capture Pipeline](#capture-pipeline)
-- [Capture Sources](#capture-sources)
-- [Encoder Selection](#encoder-selection)
-- [Video Transport](#video-transport)
-- [Audio Transport](#audio-transport)
-- [Quality Presets](#quality-presets)
-- [Adaptive Bitrate](#adaptive-bitrate)
-- [Network Feedback](#network-feedback)
-- [Running the Service](#running-the-service)
-- [Command Line Interface](#command-line-interface)
-- [IPC Overview](#ipc-overview)
-- [IPC Commands](#ipc-commands)
-- [Typical Session](#typical-session)
-- [Embedding](#embedding)
-- [Error Handling](#error-handling)
-- [Threading Model](#threading-model)
-- [Building](#building)
-- [Dependencies](#dependencies)
-- [Roadmap](#roadmap)
-- [Contributing](#contributing)
-- [Documentation](#documentation)
-- [License](#license)
+> This repository describes the current libobs-based production engine. macOS is not implemented in this codebase.
 
 ---
 
 ## Features
 
-Current capabilities include:
+### Common
+
+- Standalone JSON IPC service
+- libobs 32.1.2 media pipeline
+- H.264 hardware encoding
+- NVIDIA NVENC
+- Intel QSV
+- AMD AMF through `obs-ffmpeg`
+- Optional x264 when explicitly requested
+- RTP video transport
+- RTP Opus audio transport
+- RTP/RTCP feedback handling
+- RTX retransmission support
+- TWCC RTP header extension
+- Packet pacing and queue controls
+- Runtime bitrate adaptation
+- Runtime bitrate override
+- PLI/FIR-driven keyframe handling
+- Capture lifecycle monitoring
+- Asynchronous/cancellable capture startup
+- Deterministic OBS runtime build scripts
+- CMake / C++17
+
+### Windows
 
 - Windows Graphics Capture (WGC)
 - Window capture
 - Monitor capture
-- Hardware-accelerated H.264 encoding
-- Automatic encoder selection
-- NVIDIA NVENC support
-- AMD AMF support
-- Intel Quick Sync Video (QSV) support
-- x264 software fallback
-- RTP video streaming
-- RTP audio streaming
-- Adaptive bitrate control
-- Live network feedback
-- Runtime bitrate updates
-- PNG thumbnail generation
-- JSON IPC service
-- Headless service mode
-- Graceful startup and shutdown
-- CMake build system
-- C++17
+- Visible-window enumeration
+- WASAPI desktop audio
+- WASAPI process audio
+- D3D11 capture path
 
----
+### Linux
 
-## Why native-stream-engine?
-
-Many modern communication platforms require a native media pipeline rather than relying exclusively on browser capture APIs.
-
-This project was created to provide a reusable streaming backend that can be embedded into desktop applications while maintaining full control over:
-
-- capture
-- encoding
-- transport
-- bitrate adaptation
-- process lifecycle
-- host communication
-
-Instead of exposing libobs directly to the application, the engine acts as an isolated process with a stable JSON protocol. This keeps the application architecture simpler while allowing the native component to evolve independently.
+- OBS PipeWire portal monitor/window capture
+- PipeWire portal restore-token support
+- PulseAudio desktop output capture
+- PipeWire application audio capture
+- Application-audio resolution using portal/application/process identity
+- Linux-native RTP sender wake/socket path
 
 ---
 
 ## Architecture
 
 ```text
-               Host Application
-          (Electron / Desktop App)
+                       Host Application
+                  (Electron / Desktop App)
+                              │
+                    line-delimited JSON
+                              │
+                              ▼
+                    native-stream-engine
+                              │
+                  ┌───────────┴───────────┐
+                  │                       │
+                  ▼                       ▼
+             NativeService             ObsEngine
+                                          │
+                       ┌──────────────────┼──────────────────┐
+                       │                  │                  │
+                       ▼                  ▼                  ▼
+                 Video Capture       Audio Capture       libobs
+                       │                  │                  │
+                       └───────────┬──────┘                  │
+                                   ▼                         │
+                            H.264 / Opus Encoders ◄──────────┘
+                                   │
+                                   ▼
+                           Native RTP Output
+                                   │
+                                   ▼
+                         RealtimeRtpSender
+                                   │
+                      ┌────────────┼────────────┐
+                      ▼            ▼            ▼
+                    Pacer         RTX       RTCP/TWCC
                       │
-                      │ JSON IPC
                       ▼
-          native-stream-engine
-                      │
-                      ▼
-                  libobs
-                      │
-          ┌───────────┴───────────┐
-          │                       │
-          ▼                       ▼
-   Capture Pipeline        Audio Pipeline
-          │                       │
-          └───────────┬───────────┘
-                      ▼
-              Encoder Selection
-                      │
-                      ▼
-           RTP Video / RTP Audio
-                      │
-                      ▼
-                  Network
+                     UDP
 ```
 
-The engine is designed as a separate executable rather than a shared library. This architecture isolates the native media stack from the host application and allows clean startup, shutdown, crash recovery, and independent versioning.
+The host application never links to libobs directly. The engine owns OBS startup, capture sources, encoders, encoded packet callbacks, transport, feedback, and cleanup.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the internal design.
 
 ---
 
-## Repository Structure
+## Platform support
+
+| Area | Windows | Linux |
+|---|---|---|
+| Build | Supported | Supported |
+| OBS runtime | Pinned source-built runtime | Pinned source-built runtime |
+| Monitor capture | WGC | PipeWire portal |
+| Window/application capture | WGC | PipeWire portal |
+| Desktop audio | WASAPI output capture | PulseAudio output capture |
+| Application/process audio | WASAPI process loopback | PipeWire application capture |
+| Source enumeration CLI | Supported | Not implemented yet |
+| NVENC | Supported when available | Supported when available |
+| QSV | Supported when available | Supported when available |
+| AMD AMF | Supported when OBS exposes the encoder | Platform/runtime dependent |
+| x264 | Explicit request only | Explicit request only |
+| macOS | Not implemented | Not implemented |
+
+### Current Linux limitation
+
+`--list-sources` does not yet enumerate Linux portal sources. On Linux it returns empty `monitors` and `windows` arrays in JSON mode. Capture selection is handled through the PipeWire/desktop portal flow during capture creation.
+
+---
+
+## Capture paths
+
+### Windows video
+
+```text
+Selected HWND / monitor
+        │
+        ▼
+Windows Graphics Capture
+        │
+        ▼
+D3D11 texture
+        │
+        ▼
+Native WGC OBS source
+        │
+        ▼
+OBS scene / video pipeline
+        │
+        ▼
+H.264 encoder
+```
+
+### Windows audio
+
+For monitor/desktop capture:
+
+```text
+Default output device
+        │
+        ▼
+WASAPI output capture
+        │
+        ▼
+OBS audio
+        │
+        ▼
+Opus
+```
+
+For window/game capture:
+
+```text
+Selected window
+        │
+        ▼
+OBS WASAPI process output capture
+        │
+        ▼
+OBS audio
+        │
+        ▼
+Opus
+```
+
+When `audio=auto`, Windows uses desktop audio for monitor capture and first attempts process audio for a non-monitor capture. If automatic process audio creation fails, the service can fall back to desktop audio.
+
+### Linux video
+
+```text
+Portal capture request
+        │
+        ▼
+OBS linux-pipewire source
+        │
+        ▼
+PipeWire stream
+        │
+        ▼
+OBS scene / video pipeline
+        │
+        ▼
+H.264 encoder
+```
+
+The Linux OBS patch exposes the portal restore token through a private source setting so the engine can use portal/application identity during capture and audio resolution.
+
+### Linux audio
+
+Desktop:
+
+```text
+Default PulseAudio/PipeWire-compatible output
+        │
+        ▼
+pulse_output_capture
+        │
+        ▼
+Opus
+```
+
+Application:
+
+```text
+Portal/application identity
+        │
+        ▼
+PipeWire application resolution
+        │
+        ▼
+pipewire_audio_application_capture
+        │
+        ▼
+Opus
+```
+
+If Linux `audio=auto` cannot resolve application audio for a non-monitor capture, the current service can continue video-only rather than failing the entire stream.
+
+---
+
+## Encoder selection
+
+The engine discovers encoder IDs registered by the runtime and builds an ordered candidate list.
+
+### `encoder=auto`
+
+Current automatic order:
+
+1. NVIDIA NVENC
+2. Intel QSV
+3. AMD AMF
+
+`auto` does **not** automatically append x264.
+
+### Explicit requests
+
+- `nvenc`: NVENC → QSV → AMF fallback order
+- `qsv`: QSV → NVENC → AMF fallback order
+- `amd` / `amf`: AMF → NVENC → QSV fallback order
+- `x264`: x264 only
+
+The selected H.264 configuration is optimized for interactive streaming:
+
+- CBR
+- 2-second keyframe interval
+- baseline profile
+- B-frames disabled
+- low-latency NVENC tuning
+- repeat headers enabled
+
+The pinned OBS patches reduce unnecessary encoder resets during runtime bitrate and keyframe handling.
+
+---
+
+## Quality presets
+
+The service accepts these quality names:
+
+| Preset | Output | FPS | Initial video bitrate |
+|---|---:|---:|---:|
+| `720p30` | 1280×720 | 30 | 2500 kbps |
+| `720p60` | 1280×720 | 60 | 4500 kbps |
+| `1080p30` | 1920×1080 | 30 | 5500 kbps |
+| `1080p60` | 1920×1080 | 60 | 8000 kbps |
+
+Audio uses OBS `ffmpeg_opus` at 160 kbps when audio RTP is enabled.
+
+---
+
+## RTP transport
+
+Encoded packets leave OBS through a small custom encoded-output adapter:
+
+- `native_rtp_video_output` for video-only sessions
+- `native_rtp_av_output` for video + audio sessions
+
+The adapter forwards encoded packets to the engine-owned transport instead of using an OBS network output.
+
+### Video transport
+
+The RTP sender includes:
+
+- H.264 NAL packetization
+- fragmentation for large NAL units
+- bounded media queue
+- adaptive packet pacing
+- queue-latency telemetry
+- TWCC RTP header extension
+- RTCP receive path
+- NACK handling
+- packet history
+- RTX retransmissions
+- duplicate RTX suppression
+- bounded pending retransmission queue
+- retransmission rate limiting
+- fair servicing of fresh media and retransmissions
+
+### Audio transport
+
+Opus is sent over a separate RTP sender with its own destination, payload type, SSRC, pacing state, and counters.
+
+---
+
+## Network feedback and bitrate control
+
+The host can send runtime network feedback to the service.
+
+Current feedback fields include:
+
+- packet loss
+- jitter
+- optional RTT
+- score
+- receiver-estimated bitrate
+- packet count
+- byte count
+- NACK count
+- NACK packet count
+- PLI count
+- FIR count
+- keyframe reason
+
+The feedback path is:
+
+```text
+Host feedback
+     │
+     ▼
+NativeService
+     │
+     ▼
+ObsEngine
+     │
+     ├──────────────► keyframe policy
+     │
+     ▼
+RtpPacer / BitrateController
+     │
+     ▼
+BitrateUpdateScheduler
+     │
+     ▼
+OBS encoder update
+```
+
+The controller and scheduler avoid applying every small feedback fluctuation directly to the encoder.
+
+---
+
+## Capture lifecycle
+
+Capture startup is asynchronous.
+
+A normal successful start is:
+
+```text
+startCapture request
+        │
+        ▼
+captureStarting
+        │
+        ▼
+capture/source initialization
+        │
+        ▼
+first frame confirmation
+        │
+        ▼
+audio initialization
+        │
+        ▼
+RTP initialization
+        │
+        ▼
+captureStartResult (ok=true)
+```
+
+`stopCapture` can cancel an in-progress start. The service also watches the active capture target and can emit `captureEnded` when the target closes.
+
+Shutdown performs explicit cleanup of RTP, encoders, sources, scenes, OBS state, and service threads.
+
+---
+
+## Command line
+
+### Windows
+
+```powershell
+.\build-windows-test\Release\native-stream-engine.exe --service
+.\build-windows-test\Release\native-stream-engine.exe --list
+.\build-windows-test\Release\native-stream-engine.exe --list-windows
+.\build-windows-test\Release\native-stream-engine.exe --list-sources --json 1
+```
+
+### Linux
+
+```bash
+./build-linux-nodeps-test/native-stream-engine --service
+./build-linux-nodeps-test/native-stream-engine --list
+./build-linux-nodeps-test/native-stream-engine --list-sources --json 1
+```
+
+`--list-windows` is Windows-only.
+
+`--list` initializes the configured OBS runtime, prints runtime/module/encoder information, and shuts down.
+
+---
+
+## IPC commands and events
+
+The service uses newline-delimited UTF-8 JSON.
+
+Current request/response/event types include:
+
+- `ping` / `pong`
+- `listSources` / `sources`
+- `capturePreview` / `capturePreviewResult`
+- `startCapture`
+- `captureStarting`
+- `captureStartResult`
+- `stopCapture` / `captureStopped`
+- `captureEnded`
+- `setTargetBitrate` / `targetBitrateAck`
+- `networkFeedback` / `networkFeedbackAck`
+- `networkFeedbackIgnored`
+- `simulateNetworkFeedback` / `simulateNetworkFeedbackAck`
+- `shutdown` / `shutdown_ack`
+
+### Example: start capture
+
+```json
+{
+  "id": 1,
+  "type": "startCapture",
+  "capture": "window",
+  "hwnd": 123456,
+  "quality": "1080p60",
+  "audio": "auto",
+  "encoder": "auto",
+  "rtpIp": "127.0.0.1",
+  "rtpPort": 5004,
+  "payloadType": 102,
+  "ssrc": 287454020,
+  "rtxSsrc": 1432778632,
+  "rtxPayloadType": 103,
+  "audioRtpIp": "127.0.0.1",
+  "audioRtpPort": 5006,
+  "audioPayloadType": 111,
+  "audioSsrc": 573785173
+}
+```
+
+For Linux application audio the host may also provide `audioTarget`. When omitted, the engine can use the application identity resolved from the active portal capture where available.
+
+---
+
+## Repository structure
 
 ```text
 native-stream-engine/
 ├── compatibility/
+│   └── obs-32.1.2/
+│       ├── obs.lib
+│       └── obsconfig.h
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   └── BUILDING.md
+├── patches/
+│   └── obs/
 ├── scripts/
+│   ├── build-obs-linux-runtime.sh
+│   └── build-obs-windows-runtime.ps1
 ├── src/
 ├── CMakeLists.txt
-├── BUILDING.md
 ├── COPYRIGHT
 ├── LICENSE
 └── README.md
 ```
 
-The following directories are intentionally excluded from version control:
+Generated/local directories such as `runtime/`, build directories, temporary OBS source/build trees, and capture/debug output are not intended to be committed.
+
+---
+
+## OBS runtime model
+
+OBS source is not vendored into this repository.
+
+Both runtime builders clone **OBS Studio 32.1.2** and verify the exact commit:
 
 ```text
-build/
-deps/
-runtime/
+fb4d98bf88fae5fc85cb11fc57f7c5e309282194
 ```
 
-These directories contain generated build outputs or locally installed third-party dependencies.
+They then apply native-stream-engine patches before building the required subset of OBS.
 
----
+Current patches:
 
-## Supported Platform
+- `common-nvenc-lightweight-reconfig.patch`
+- `common-qsv-skip-noop-reconfig.patch`
+- `linux-pipewire-expose-restore-token.patch`
 
-The current implementation targets the following environment:
+See [patches/obs/README.md](patches/obs/README.md).
 
-| Component     | Status    |
-| ------------- | --------- |
-| Windows       | Supported |
-| x64           | Supported |
-| MSVC          | Supported |
-| CMake         | Supported |
-| C++17         | Supported |
-| libobs 32.1.2 | Supported |
-
-The engine currently targets Windows only.
-
-Support for additional operating systems may be introduced in future releases.
-
----
-
-## Design Goals
-
-The project follows several architectural principles:
-
-- Keep the native engine independent from the host application.
-- Communicate only through a documented JSON protocol.
-- Minimize direct dependencies between the UI and the streaming backend.
-- Prefer hardware acceleration whenever available.
-- Fall back gracefully when hardware encoders are unavailable.
-- Keep the capture pipeline deterministic and predictable.
-- Support long-running background operation.
-- Make build and runtime dependencies explicit.
-- Avoid exposing unnecessary libobs implementation details.
-
-These principles guide both the public API and the internal implementation.
-
----
-
-## Capture Pipeline
-
-The engine separates media acquisition, encoding, and transport into independent stages.
-
-```text
-Windows Graphics Capture
-        │
-        │
-        ▼
- Frame Acquisition
-        │
-        ▼
- Resolution Scaling
-        │
-        ▼
- OBS Video Pipeline
-        │
-        ▼
- H.264 Encoder
-        │
-        ▼
- RTP Packetization
-        │
-        ▼
- UDP Transport
-```
-
-Each stage has a single responsibility, making the pipeline easier to maintain, debug, and extend.
-
-The capture layer is responsible only for acquiring frames from the operating system. Scaling, encoding, and network transport are handled independently.
-
----
-
-## Capture Sources
-
-The engine currently supports two capture source types.
-
-| Source  | Description                                                              |
-| ------- | ------------------------------------------------------------------------ |
-| Monitor | Captures an entire display using Windows Graphics Capture                |
-| Window  | Captures an individual application window using Windows Graphics Capture |
-
-The service can enumerate available capture sources before streaming begins, allowing the host application to present a source picker to the user.
-
----
-
-## Encoder Selection
-
-Hardware acceleration is preferred whenever it is available.
-
-The engine automatically selects the best encoder supported by the current system unless the host explicitly requests one.
-
-Current encoder families include:
-
-| Encoder   | Hardware                  |
-| --------- | ------------------------- |
-| NVENC     | NVIDIA GPUs               |
-| AMD AMF   | AMD GPUs                  |
-| Intel QSV | Intel integrated graphics |
-| x264      | Software fallback         |
-
-When automatic selection is enabled, the engine attempts hardware encoders before falling back to software encoding.
-
-```text
-Requested Encoder
-        │
-        ▼
-Hardware Available?
-        │
-   ┌────┴────┐
-   │         │
- Yes         No
-   │         │
-   ▼         ▼
-Hardware    x264
-Encoder    Software
-```
-
----
-
-## Video Transport
-
-Encoded H.264 frames are packetized into RTP before being transmitted.
-
-```text
-OBS Encoder
-      │
-      ▼
-Encoded H.264
-      │
-      ▼
-NAL Parser
-      │
-      ▼
-RTP Packetizer
-      │
-      ▼
-UDP Socket
-```
-
-The transport layer is intentionally separated from the encoder implementation, allowing the networking logic to evolve independently of the capture pipeline.
-
----
-
-## Audio Transport
-
-Audio follows an independent RTP pipeline.
-
-```text
-Audio Capture
-      │
-      ▼
-Audio Encoder
-      │
-      ▼
-RTP Audio Sender
-      │
-      ▼
-UDP Socket
-```
-
-Separating video and audio transport simplifies synchronization and allows each stream to be managed independently.
-
----
-
-## Quality Presets
-
-The service currently exposes several predefined quality profiles.
-
-| Preset  | Target                                                      |
-| ------- | ----------------------------------------------------------- |
-| 720p30  | 1280×720 @ 30 FPS                                           |
-| 720p60  | 1280×720 @ 60 FPS                                           |
-| 1080p30 | 1920×1080 @ 30 FPS                                          |
-| 1080p60 | 1920×1080 @ 60 FPS                                          |
-| source  | Native source resolution (subject to implementation limits) |
-
-These presets provide predictable encoding behavior while keeping the IPC interface simple.
-
----
-
-## Adaptive Bitrate
-
-Network conditions rarely remain constant during a live stream.
-
-Instead of using a fixed bitrate, the engine continuously evaluates runtime network feedback and adjusts the encoder target bitrate accordingly.
-
-```text
-Incoming Network Feedback
-        │
-        ▼
- Packet Loss
- RTT
- Jitter
- NACK
- PLI
- FIR
-        │
-        ▼
- Bitrate Controller
-        │
-        ▼
- Bitrate Scheduler
-        │
-        ▼
- Encoder Reconfiguration
-```
-
-The bitrate controller determines the desired target bitrate based on current network conditions.
-
-The scheduler prevents unnecessary encoder reconfiguration by smoothing frequent bitrate fluctuations.
-
-This approach improves stream stability while avoiding excessive encoder updates.
-
----
-
-## Network Feedback
-
-The engine accepts runtime feedback from the host application through the IPC interface.
-
-The current feedback model includes:
-
-- Packet loss ratio
-- Round-trip time (RTT)
-- Network jitter
-- Estimated bitrate
-- Packet count
-- Byte count
-- NACK statistics
-- PLI count
-- FIR count
-
-These metrics are used by the adaptive bitrate controller to determine whether the encoder bitrate should be reduced, maintained, or gradually increased.
-
----
-
-## Running the Service
-
-The engine operates as a standalone background process.
-
-Start the IPC service using:
-
-```bash
-native-stream-engine.exe --service
-```
-
-The service communicates with the host process through line-delimited JSON messages over standard input and standard output.
-
-This design allows the engine to be embedded into Electron applications, desktop applications, or any other process capable of launching a child process.
-
----
-
-## Command Line Interface
-
-The executable exposes several utility commands.
-
-| Command                   | Description                                 |
-| ------------------------- | ------------------------------------------- |
-| `--service`               | Starts the JSON IPC service                 |
-| `--list`                  | Displays available OBS modules and encoders |
-| `--list-windows`          | Enumerates visible desktop windows          |
-| `--list-sources`          | Enumerates available capture sources        |
-| `--list-sources --json 1` | Outputs capture sources as JSON             |
-
----
-
-## IPC Overview
-
-The service uses a simple request/response protocol.
-
-Each request contains an identifier.
-
-Every response includes the same identifier, allowing multiple asynchronous requests to be matched by the host application.
-
-```text
-Host Process
-      │
-      │ JSON
-      ▼
-native-stream-engine
-      │
-      │ JSON
-      ▼
-Host Process
-```
-
-Messages are encoded as UTF-8 JSON objects separated by newline characters.
-
----
-
-## IPC Commands
-
-### ping
-
-Verifies that the service is alive.
-
-Request
-
-```json
-{
-	"id": 1,
-	"type": "ping"
-}
-```
-
-Response
-
-```json
-{
-	"id": 1,
-	"ok": true,
-	"type": "pong"
-}
-```
-
----
-
-### listSources
-
-Returns all currently available capture sources.
-
-Request
-
-```json
-{
-	"id": 2,
-	"type": "listSources"
-}
-```
-
-Successful response
-
-```json
-{
-  "id": 2,
-  "ok": true,
-  "type": "sources",
-  "monitors": [...],
-  "windows": [...]
-}
-```
-
-The returned source identifiers can later be used when starting a capture session.
-
----
-
-### startCapture
-
-Starts a capture session.
-
-Example request
-
-```json
-{
-	"id": 3,
-	"type": "startCapture",
-	"capture": "window",
-	"hwnd": 123456,
-	"quality": "1080p60",
-	"encoder": "auto",
-	"rtpIp": "127.0.0.1",
-	"rtpPort": 5004
-}
-```
-
-Successful response
-
-```json
-{
-	"id": 3,
-	"ok": true,
-	"type": "captureStarted"
-}
-```
-
-If the requested capture cannot be started, the response contains `"ok": false` together with an error description.
-
----
-
-### stopCapture
-
-Stops the active capture session.
-
-Request
-
-```json
-{
-	"id": 4,
-	"type": "stopCapture"
-}
-```
-
-Response
-
-```json
-{
-	"id": 4,
-	"ok": true,
-	"type": "captureStopped"
-}
-```
-
-Stopping a capture releases the active media pipeline while keeping the service process alive.
-
----
-
-### networkFeedback
-
-Provides runtime network statistics used by the adaptive bitrate controller.
-
-Example request
-
-```json
-{
-	"id": 5,
-	"type": "networkFeedback",
-	"packetLossPermille": 12,
-	"jitterMs": 6,
-	"rttMs": 18,
-	"score": 9,
-	"bitrate": 4200000
-}
-```
-
-Response
-
-```json
-{
-	"id": 5,
-	"ok": true,
-	"type": "networkFeedbackAck"
-}
-```
-
-The controller evaluates the supplied metrics and determines whether the encoder bitrate should be adjusted.
-
----
-
-### setTargetBitrate
-
-Overrides the encoder target bitrate.
-
-Example request
-
-```json
-{
-	"id": 6,
-	"type": "setTargetBitrate",
-	"targetBitrateBps": 4500000
-}
-```
-
-Response
-
-```json
-{
-	"id": 6,
-	"ok": true,
-	"type": "targetBitrateAck",
-	"targetBitrateBps": 4500000
-}
-```
-
-This command is primarily intended for host-controlled bitrate management.
-
----
-
-### shutdown
-
-Gracefully terminates the service.
-
-Request
-
-```json
-{
-	"id": 7,
-	"type": "shutdown"
-}
-```
-
-Response
-
-```json
-{
-	"id": 7,
-	"ok": true,
-	"type": "shutdown_ack"
-}
-```
-
-The engine releases active OBS resources before exiting.
-
----
-
-## Typical Session
-
-A typical interaction between the host application and the engine looks like this.
-
-```text
-Start Service
-      │
-      ▼
-Ping
-      │
-      ▼
-List Sources
-      │
-      ▼
-User Selects Window
-      │
-      ▼
-Start Capture
-      │
-      ▼
-Receive RTP
-      │
-      ▼
-Send Network Feedback
-      │
-      ▼
-Adaptive Bitrate Updates
-      │
-      ▼
-Stop Capture
-      │
-      ▼
-Shutdown
-```
-
----
-
-## Embedding
-
-The engine is intended to be launched as a child process.
-
-A typical host application is responsible for:
-
-- starting the executable
-- writing JSON requests to stdin
-- reading JSON responses from stdout
-- handling asynchronous events
-- forwarding network statistics
-- stopping the process when no longer needed
-
-The engine intentionally does not depend on Electron and may be integrated into any desktop application capable of spawning external processes.
-
----
-
-## Error Handling
-
-All IPC requests return a JSON response.
-
-Every response contains:
-
-- request identifier
-- success flag
-- response type
-
-Additional error information is included when a request cannot be completed.
-
-This keeps the protocol deterministic and simplifies host-side error handling.
-
----
-
-## Threading Model
-
-The service is designed around a long-running command loop.
-
-Capture operations, encoder management, RTP transport, and resource cleanup are coordinated internally while presenting a synchronous request/response interface to the host application.
-
-This allows the embedding application to remain unaware of the underlying native threading model.
+The old manual `obs.def` / import-library generation workflow is no longer used. The Windows runtime builder publishes the official `obs.lib` and generated `obsconfig.h` from the same pinned OBS build.
 
 ---
 
 ## Building
 
-Detailed build instructions are available in [BUILD Guide](docs/BUILDING.md).
+See [docs/BUILDING.md](docs/BUILDING.md).
 
-The project uses CMake and targets modern MSVC toolchains with C++17.
+Short version:
 
----
+### Windows
 
-## Dependencies
+```powershell
+.\scripts\build-obs-windows-runtime.ps1
 
-This project depends on the following major components.
+cmake -S . -B build-windows-test -G "Visual Studio 17 2022" -A x64
+cmake --build build-windows-test --config Release -j
 
-| Dependency               | Purpose                               |
-| ------------------------ | ------------------------------------- |
-| libobs                   | Capture and media pipeline            |
-| OBS Plugins              | Capture, encoder and platform modules |
-| Windows Graphics Capture | Native screen capture                 |
-| Windows Media Foundation | Platform media support                |
-| WinSock                  | RTP transport                         |
-| CMake                    | Build system                          |
+.\build-windows-test\Release\native-stream-engine.exe --list
+```
 
-The project intentionally keeps third-party dependencies to a minimum.
+### Linux
 
----
+```bash
+./scripts/build-obs-linux-runtime.sh
 
-## Roadmap
+cmake -S . -B build-linux-nodeps-test -DCMAKE_BUILD_TYPE=Release
+cmake --build build-linux-nodeps-test -j"$(nproc)"
 
-The current implementation focuses on providing a stable Windows-native streaming backend.
-
-Planned improvements include:
-
-- [x] Windows Graphics Capture
-- [x] Window capture
-- [x] Monitor capture
-- [x] Hardware H.264 encoding
-- [x] Automatic encoder selection
-- [x] RTP video transport
-- [x] RTP audio transport
-- [x] Adaptive bitrate controller
-- [x] JSON IPC service
-- [x] Headless service mode
-- [ ] Multi-monitor synchronization improvements
-- [ ] Additional codec support
-- [ ] HEVC encoding
-- [ ] AV1 encoding
-- [ ] Linux support
-- [ ] macOS support
-
-The roadmap reflects current development priorities and may evolve over time.
+./build-linux-nodeps-test/native-stream-engine --list
+```
 
 ---
 
-## Contributing
+## Runtime directories
 
-Contributions are welcome.
+Generated OBS runtimes live under:
 
-Before opening a pull request, please:
+```text
+runtime/OBS-Studio-32.1.2-Windows-x64
+runtime/OBS-Studio-32.1.2-Linux-x86_64
+```
 
-- Keep changes focused and self-contained.
-- Follow the existing coding style.
-- Document new public functionality.
-- Avoid introducing unnecessary third-party dependencies.
-- Verify that the project builds successfully before submitting changes.
-
-For significant architectural changes, opening an issue for discussion beforehand is recommended.
-
----
-
-## Documentation
-
-- 📖 [Architecture](docs/ARCHITECTURE.md)
-- 🛠️ [Building Guide](docs/BUILDING.md)
+They are generated build/runtime artifacts and are not intended to be versioned in Git.
 
 ---
 
 ## License
 
-This repository is distributed under the terms of the GNU General Public License Version 2 (GPL-2.0).
+`native-stream-engine` is distributed under GPL-2.0-or-later. See [LICENSE](LICENSE) and [COPYRIGHT](COPYRIGHT).
 
-See the [LICENSE](LICENSE) file for the complete license text.
-
----
-
-## Third-Party Software
-
-This project is built on top of **libobs**, which is developed and maintained by the OBS Studio project and licensed under the GNU GPL Version 2.
-
-All respective copyrights remain with their original authors.
+The project links against and builds components from OBS Studio/libobs. Third-party components retain their respective licenses and copyrights.
 
 ---
 
-## Acknowledgements
+## Documentation
 
-This project would not be possible without the work of the OBS Studio contributors and the broader open-source community.
-
-Special thanks to everyone involved in the development and maintenance of **libobs**.
+- [Architecture](docs/ARCHITECTURE.md)
+- [Building](docs/BUILDING.md)
+- [OBS patches](patches/obs/README.md)
