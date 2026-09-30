@@ -1,0 +1,22 @@
+--- a/plugins/linux-pipewire/screencast-portal.c
++++ b/plugins/linux-pipewire/screencast-portal.c
+@@ -257,8 +257,18 @@ static void on_start_response_received_cb(GVariant *parameters, void *user_data)
+ 
+ 		restore_token = g_variant_lookup_value(result, "restore_token", G_VARIANT_TYPE_STRING);
+-		if (restore_token)
++		if (restore_token) {
+ 			capture->restore_token = bstrdup(g_variant_get_string(restore_token, NULL));
+ 
++			obs_data_t *private_settings = obs_source_get_private_settings(capture->source);
++			if (private_settings) {
++				obs_data_set_string(
++					private_settings,
++					"__nse_linux_restore_token",
++					capture->restore_token);
++				obs_data_release(private_settings);
++			}
++		}
++
+ 		obs_source_save(capture->source);
+ 	}
+ 

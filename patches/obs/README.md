@@ -1,80 +1,100 @@
-# OBS libobs patches
+# OBS patches for native-stream-engine
 
-This folder holds small source patches kept to fix a specific behavior in
-certain OBS Studio encoder plugins (nvenc, qsv) that native-stream-engine
-relies on. OBS Studio source is never vendored into this repo — the
-patches are DIFFs applied to the relevant files at build time, against a
-pinned OBS version, in a temporary folder, by `scripts/build-patched-obs-plugins.ps1`.
+This directory contains the small OBS Studio source patches required by
+native-stream-engine.
 
-## Why these patches exist
+OBS Studio source is not vendored into this repository. The build scripts
+clone the pinned OBS version into a temporary working directory and apply
+the relevant patches before building the runtime.
 
-On the WebRTC/RTP side, native-stream-engine calls `obs_encoder_update()`
-whenever a PLI (Picture Loss Indication) arrives and whenever the adaptive
-bitrate changes. What that actually does inside libobs depends entirely on
-the encoder plugin:
+The current OBS version is pinned to 32.1.2.
 
-- **obs-nvenc** (`plugins/obs-nvenc/nvenc.c`, `nvenc_update()`):
-  `NV_ENC_RECONFIGURE_PARAMS.resetEncoder` and `.forceIDR` are always set
-  to `1` TOGETHER. So every update fully resets the NVENC session
-  (rate-control state, motion estimation history included). This causes a
-  visible encode-pipeline hitch (freeze).
+## Patch naming
 
-- **obs-qsv11** (`QSV_Encoder_Internal.cpp`, `ReconfigureEncoder()`):
-  Same class of issue — `MFXVideoENCODE_Reset()` does a full reset on
-  every update.
+Patch filenames are prefixed according to the platforms that use them:
 
-- **obs-ffmpeg/texture-amf.cpp** (AMD): Already does the right thing —
-  no reset in CBR mode, the next frame is simply marked IDR via the
-  `force_idr` flag. No patch needed for AMD.
+- `common-*.patch`
+  Applied on both Windows and Linux.
 
-## Patches
+- `windows-*.patch`
+  Applied only by the Windows OBS runtime build.
 
-- `nvenc-lightweight-reconfig.patch` — STATUS: ready, integrated into
-  obs_engine.cpp. Adds two new obs_data keys to `nvenc_update()`:
-  - `__nse_lightweight` (bool): when true, `resetEncoder=0` is set.
-  - `__nse_force_idr_only` (bool): when true, `forceIDR=1` is set
-    (without a reset). native-stream-engine sends this as true for
-    PLI/keyframe requests, and false for plain bitrate updates.
+- `linux-*.patch`
+  Applied only by the Linux OBS runtime build.
 
-  IMPORTANT: I could not 100% confirm from NVIDIA documentation whether
-  the `resetEncoder=0` + `forceIDR=1` combination is officially supported
-  by the NVENC SDK — this should be verified on real hardware, checking
-  encode callback logs (whether there's a frame gap, whether an IDR
-  actually arrives). If it misbehaves, a fallback is to use
-  `resetEncoder=0` only for bitrate-only updates (`force_idr_only=false`)
-  and fall back to the old `resetEncoder=1` behavior for PLI-driven
-  keyframe requests (with a much longer cooldown).
+The build scripts use `git apply --check` before applying each patch and
+fail immediately if a patch no longer matches the pinned OBS source.
 
-- `qsv-skip-noop-reconfig.patch` — STATUS: ready (partial), integrated
-  into obs_engine.cpp. Stock `obs_qsv_update()` called
-  `MFXVideoENCODE_Reset()` unconditionally on every call, with no
-  condition check at all (worse than NVENC, which at least checked
-  `can_change_bitrate`). This patch skips the reset when the bitrate
-  hasn't actually changed.
+## Current patches
 
-  REMAINING GAP: On a genuine PLI keyframe request, QSV still falls
-  through to `MFXVideoENCODE_Reset()` — QSV doesn't yet have an
-  NVENC/AMF-level "just mark the next frame IDR without a reset"
-  mechanism. Doing this properly requires passing Intel Media SDK/VPL's
-  `mfxEncodeCtrl` struct (`FrameType = MFX_FRAMETYPE_I | MFX_FRAMETYPE_IDR
-| MFX_FRAMETYPE_REF`) as a per-frame parameter to the
-  `EncodeFrameAsync()` call inside `QSV_Encoder_Internal::Encode()` /
-  `Encode_tex()`. I couldn't safely write that diff without seeing the
-  full current contents of that file (I only saw fragments of it) — feel
-  free to paste it in, or I can fetch it in full again in a future
-  session to finish this.
+### common-nvenc-lightweight-reconfig.patch
 
-## Changes on the native-stream-engine side
+Modifies `plugins/obs-nvenc/nvenc.c`.
 
-`src/obs_engine.cpp`:
+native-stream-engine uses two private OBS settings:
 
-- `requestRtpVideoKeyframe()` now works for NVENC + AMF + QSV (texture
-  variants); it sets the correct keys for each family.
-- `updateRtpVideoEncoderBitrate()` puts NVENC into lightweight mode
-  (`__nse_lightweight=true`, `__nse_force_idr_only=false` — we
-  deliberately don't force an IDR on a plain bitrate change). QSV
-  already benefits automatically from the patch's own no-op-skip logic,
-  no extra code was needed.
-- This code still works unmodified against a stock, unpatched OBS
-  runtime (unknown `__nse_*` keys silently resolve to `false`) — you
-  just lose the patch's actual benefit in that case.
+- `__nse_lightweight`
+  Keeps `resetEncoder=0` for lightweight encoder reconfiguration.
+
+- `__nse_force_idr_only`
+  Requests an IDR frame without forcing an encoder reset.
+
+This allows bitrate updates and PLI/keyframe handling to avoid unnecessary
+full NVENC session resets.
+
+### common-qsv-skip-noop-reconfig.patch
+
+Modifies the OBS QSV encoder implementation.
+
+The stock update path can call `MFXVideoENCODE_Reset()` during encoder
+reconfiguration. The patch avoids the reset when the effective bitrate has
+not changed.
+
+A genuine QSV keyframe/PLI request can still use the heavier reset path.
+
+### linux-pipewire-expose-restore-token.patch
+
+Modifies the OBS Linux PipeWire screencast portal integration.
+
+When the desktop portal returns a PipeWire restore token, the patch exposes
+that token through the OBS source private settings using:
+
+`__nse_linux_restore_token`
+
+native-stream-engine uses this value to support Linux portal capture
+restoration without maintaining a separate fork of the PipeWire capture
+implementation.
+
+## Encoder behavior
+
+### NVIDIA NVENC
+
+native-stream-engine uses the patched lightweight reconfiguration path for
+bitrate updates and can request an IDR without resetting the encoder.
+
+### Intel QSV
+
+No-op reconfiguration is skipped when the bitrate has not changed.
+Keyframe/PLI handling may still require the heavier QSV reset path.
+
+### AMD AMF
+
+AMD AMF support is provided through `obs-ffmpeg`.
+
+OBS 32.1.2 does not use a separate `obs-amd-encoder` module in this runtime.
+No native-stream-engine OBS patch is currently required for AMD AMF.
+
+## Build scripts
+
+Windows applies:
+
+- `common-*.patch`
+- `windows-*.patch`
+
+Linux applies:
+
+- `common-*.patch`
+- `linux-*.patch`
+
+Platform-specific patches are therefore never applied to the wrong OBS
+runtime build.

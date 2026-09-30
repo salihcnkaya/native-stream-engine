@@ -1,11 +1,13 @@
 #pragma once
 
-#define OBS_VERSION "32.1.2"
-#define OBS_VERSION_MAJOR 32
-#define OBS_VERSION_MINOR 1
-#define OBS_VERSION_PATCH 2
-
 #define OBS_DATA_PATH "../../data"
-#define OBS_INSTALL_PREFIX ""
+#define OBS_PLUGIN_PATH "../..//obs-plugins/64bit"
+#define OBS_PLUGIN_DESTINATION "obs-plugins/64bit"
 
-#define HAVE_OBSCONFIG_H 1
+/* #undef GIO_FOUND */
+/* #undef PULSEAUDIO_FOUND */
+/* #undef XCB_XINPUT_FOUND */
+/* #undef ENABLE_WAYLAND */
+
+#define OBS_RELEASE_CANDIDATE 0
+#define OBS_BETA 0
