@@ -4,7 +4,102 @@
 #include <chrono>
 #include <iostream>
 
+#if defined(_WIN32)
+
 #pragma comment(lib, "Ws2_32.lib")
+
+#else
+
+#include <arpa/inet.h>
+#include <cerrno>
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#endif
+
+namespace {
+
+bool initializeSocketPlatform()
+{
+#if defined(_WIN32)
+    WSADATA wsaData {};
+    return WSAStartup(MAKEWORD(2, 2), &wsaData) == 0;
+#else
+    return true;
+#endif
+}
+
+void cleanupSocketPlatform()
+{
+#if defined(_WIN32)
+    WSACleanup();
+#endif
+}
+
+void closeSocketPlatform(SOCKET socket)
+{
+    if (socket == INVALID_SOCKET) {
+        return;
+    }
+
+#if defined(_WIN32)
+    closesocket(socket);
+#else
+    ::close(socket);
+#endif
+}
+
+int lastSocketError()
+{
+#if defined(_WIN32)
+    return WSAGetLastError();
+#else
+    return errno;
+#endif
+}
+
+bool socketWouldBlock(int error)
+{
+#if defined(_WIN32)
+    return error == WSAEWOULDBLOCK;
+#else
+    return error == EAGAIN || error == EWOULDBLOCK;
+#endif
+}
+
+bool setSocketNonBlocking(SOCKET socket)
+{
+#if defined(_WIN32)
+
+    u_long nonBlocking = 1;
+
+    return ioctlsocket(
+        socket,
+        FIONBIO,
+        &nonBlocking
+    ) == 0;
+
+#else
+
+    const int flags = fcntl(socket, F_GETFL, 0);
+
+    if (flags < 0) {
+        return false;
+    }
+
+    return fcntl(
+        socket,
+        F_SETFL,
+        flags | O_NONBLOCK
+    ) == 0;
+
+#endif
+}
+
+} // namespace
 
 static constexpr bool STREAM_DEBUG_RTP_STATS = false;
 static constexpr bool STREAM_DEBUG_RTCP_NACK = false;
@@ -25,6 +120,11 @@ void RealtimeRtpSender::setLabel(const std::string& label)
 void RealtimeRtpSender::setInitialBitrate(uint32_t bitrateBps)
 {
     pacer_.setInitialBitrate(bitrateBps);
+}
+
+void RealtimeRtpSender::setAppliedBitrate(uint32_t bitrateBps)
+{
+    pacer_.setAppliedBitrate(bitrateBps);
 }
 
 BitrateDecision RealtimeRtpSender::bitrateDecision() const
@@ -50,6 +150,16 @@ void RealtimeRtpSender::resetStats()
     );
 
     bytesSent_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    wirePacketsSent_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    wireBytesSent_.store(
         0,
         std::memory_order_relaxed
     );
@@ -112,6 +222,77 @@ void RealtimeRtpSender::resetStats()
     retransmitWindowStartedAt_ =
         std::chrono::steady_clock::time_point{};
 
+    retransmitPublishSequence_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    retransmitConsumeSequence_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    retransmitRequests_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    retransmitQueued_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    retransmitQueueDropped_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    retransmitPacketsSent_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    retransmitSendFailures_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    maxRetransmitQueueSeen_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    maxRetransmitQueueLatencyMs_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    retransmitRateLimited_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    controlPacketsReceived_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    controlReceiveErrors_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    fragmentedNalAdmissionDrops_.store(
+        0,
+        std::memory_order_relaxed
+    );
+
+    for (auto& pending : pendingRetransmits_) {
+        pending.rtpSequenceNumber = 0;
+        pending.sequence = 0;
+        pending.enqueuedAt = std::chrono::steady_clock::time_point{};
+    }
+
     senderLoopIterations_.store(
         0,
         std::memory_order_relaxed
@@ -149,8 +330,10 @@ void RealtimeRtpSender::resetStats()
 
     pacer_.resetTelemetry();
 
-    for (auto& seq : lastRetransmitSeqs_) {
-        seq = 0xffff;
+    for (size_t i = 0; i < lastRetransmitSeqs_.size(); ++i) {
+        lastRetransmitSeqs_[i] = 0xffff;
+        lastRetransmitTimes_[i] =
+            std::chrono::steady_clock::time_point{};
     }
 
     for (auto& packet : history_) {
@@ -196,10 +379,12 @@ bool RealtimeRtpSender::start(
     sequenceNumber_ = 1;
     twccSequenceNumber_ = 1;
 
-    WSADATA wsaData {};
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        std::cerr << "[Realtime RTP Sender:" << label_
-                  << "] WSAStartup failed\n";
+    if (!initializeSocketPlatform()) {
+        std::cerr
+            << "[Realtime RTP Sender:"
+            << label_
+            << "] socket platform initialization failed\n";
+
         return false;
     }
 
@@ -208,7 +393,7 @@ bool RealtimeRtpSender::start(
     if (socket_ == INVALID_SOCKET) {
         std::cerr << "[Realtime RTP Sender:" << label_
                   << "] socket failed\n";
-        WSACleanup();
+        cleanupSocketPlatform();
         return false;
     }
 
@@ -217,7 +402,11 @@ bool RealtimeRtpSender::start(
         socket_,
         SOL_SOCKET,
         SO_SNDBUF,
-        reinterpret_cast<const char*>(&sendBufferSize),
+        #if defined(_WIN32)
+            reinterpret_cast<const char*>(&sendBufferSize),
+        #else
+            &sendBufferSize,
+        #endif
         sizeof(sendBufferSize)
     );
 
@@ -229,9 +418,9 @@ bool RealtimeRtpSender::start(
         std::cerr << "[Realtime RTP Sender:" << label_
                   << "] invalid ip: " << ip_ << "\n";
 
-        closesocket(socket_);
+        closeSocketPlatform(socket_);
         socket_ = INVALID_SOCKET;
-        WSACleanup();
+        cleanupSocketPlatform();
 
         return false;
     }
@@ -243,18 +432,32 @@ bool RealtimeRtpSender::start(
         ) == SOCKET_ERROR) {
         std::cerr << "[Realtime RTP Sender:" << label_
                 << "] UDP connect failed: "
-                << WSAGetLastError()
+                << lastSocketError()
                 << "\n";
 
-        closesocket(socket_);
+        closeSocketPlatform(socket_);
         socket_ = INVALID_SOCKET;
-        WSACleanup();
+        cleanupSocketPlatform();
 
         return false;
     }
 
-    u_long nonBlocking = 1;
-    ioctlsocket(socket_, FIONBIO, &nonBlocking);
+    if (!setSocketNonBlocking(socket_)) {
+        std::cerr
+            << "[Realtime RTP Sender:"
+            << label_
+            << "] failed to enable non-blocking socket, error="
+            << lastSocketError()
+            << "\n";
+
+        closeSocketPlatform(socket_);
+        socket_ = INVALID_SOCKET;
+        cleanupSocketPlatform();
+
+        return false;
+    }
+
+    #if defined(_WIN32)
 
     packetAvailableEvent_ = CreateEventW(
         nullptr,
@@ -271,9 +474,9 @@ bool RealtimeRtpSender::start(
             << GetLastError()
             << "\n";
 
-        closesocket(socket_);
+        closeSocketPlatform(socket_);
         socket_ = INVALID_SOCKET;
-        WSACleanup();
+        cleanupSocketPlatform();
 
         return false;
     }
@@ -286,16 +489,16 @@ bool RealtimeRtpSender::start(
                 << "[Realtime RTP Sender:"
                 << label_
                 << "] WSACreateEvent failed, error="
-                << WSAGetLastError()
+                << lastSocketError()
                 << "\n";
 
             CloseHandle(packetAvailableEvent_);
             packetAvailableEvent_ = nullptr;
 
-            closesocket(socket_);
+            closeSocketPlatform(socket_);
             socket_ = INVALID_SOCKET;
 
-            WSACleanup();
+            cleanupSocketPlatform();
             return false;
         }
 
@@ -310,7 +513,7 @@ bool RealtimeRtpSender::start(
                 << "[Realtime RTP Sender:"
                 << label_
                 << "] WSAEventSelect failed, error="
-                << WSAGetLastError()
+                << lastSocketError()
                 << "\n";
 
             WSACloseEvent(socketReadEvent_);
@@ -319,13 +522,37 @@ bool RealtimeRtpSender::start(
             CloseHandle(packetAvailableEvent_);
             packetAvailableEvent_ = nullptr;
 
-            closesocket(socket_);
+            closeSocketPlatform(socket_);
             socket_ = INVALID_SOCKET;
 
-            WSACleanup();
+            cleanupSocketPlatform();
             return false;
         }
     }
+
+    #else
+
+        packetAvailableEventFd_ = eventfd(
+        0,
+        EFD_NONBLOCK | EFD_CLOEXEC
+    );
+
+    if (packetAvailableEventFd_ < 0) {
+        std::cerr
+            << "[Realtime RTP Sender:"
+            << label_
+            << "] eventfd creation failed, error="
+            << errno
+            << "\n";
+
+        closeSocketPlatform(socket_);
+        socket_ = INVALID_SOCKET;
+        cleanupSocketPlatform();
+
+        return false;
+    }
+
+    #endif
     
     running_ = true;
     senderThreadRunning_ = true;
@@ -348,15 +575,56 @@ void RealtimeRtpSender::stop()
     std::cerr << "[Realtime RTP Sender:" << label_
               << "] stopping\n";
 
+    const auto stopDrainStartedAt =
+        std::chrono::steady_clock::now();
+
+    const uint64_t stopPendingMedia =
+        publishSequence_.load(std::memory_order_acquire) -
+        consumeSequence_.load(std::memory_order_acquire);
+
+    const uint64_t stopPendingRtx =
+        retransmitPublishSequence_.load(std::memory_order_acquire) -
+        retransmitConsumeSequence_.load(std::memory_order_acquire);
+
     senderThreadRunning_ = false;
+
+    #if defined(_WIN32)
 
     if (packetAvailableEvent_) {
         SetEvent(packetAvailableEvent_);
     }
 
+    #else
+
+    if (packetAvailableEventFd_ >= 0) {
+        const uint64_t signal = 1;
+
+        const ssize_t written = ::write(
+            packetAvailableEventFd_,
+            &signal,
+            sizeof(signal)
+        );
+
+        (void)written;
+    }
+
+    #endif
+
     if (senderThread_.joinable()) {
         senderThread_.join();
     }
+
+    const uint64_t stopDrainMs =
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<
+                std::chrono::milliseconds
+            >(
+                std::chrono::steady_clock::now() -
+                stopDrainStartedAt
+            ).count()
+        );
+
+    #if defined(_WIN32)
 
     if (socketReadEvent_ != WSA_INVALID_EVENT) {
         WSACloseEvent(socketReadEvent_);
@@ -368,12 +636,21 @@ void RealtimeRtpSender::stop()
         packetAvailableEvent_ = nullptr;
     }
 
+    #else
+
+    if (packetAvailableEventFd_ >= 0) {
+        ::close(packetAvailableEventFd_);
+        packetAvailableEventFd_ = -1;
+    }
+
+    #endif
+
     if (socket_ != INVALID_SOCKET) {
-        closesocket(socket_);
+        closeSocketPlatform(socket_);
         socket_ = INVALID_SOCKET;
     }
 
-    WSACleanup();
+    cleanupSocketPlatform();
 
     running_ = false;
 
@@ -411,8 +688,16 @@ void RealtimeRtpSender::stop()
         << packetsSent_.load(std::memory_order_relaxed)
         << " dropped="
         << packetsDropped_.load(std::memory_order_relaxed)
+        << " nalAdmissionDrop="
+        << fragmentedNalAdmissionDrops_.load(
+            std::memory_order_relaxed
+        )
         << " bytes="
         << bytesSent_.load(std::memory_order_relaxed)
+        << " wireSent="
+        << wirePacketsSent_.load(std::memory_order_relaxed)
+        << " wireBytes="
+        << wireBytesSent_.load(std::memory_order_relaxed)
         << " maxQueue="
         << maxQueueSeen_.load(std::memory_order_relaxed)
         << " avgQueueLatencyMs="
@@ -467,6 +752,36 @@ void RealtimeRtpSender::stop()
         << averageYieldsPerWait
         << " pacerLateResets="
         << pacerTelemetry.lateResets
+        << " stopPendingMedia="
+        << stopPendingMedia
+        << " stopPendingRtx="
+        << stopPendingRtx
+        << " stopDrainMs="
+        << stopDrainMs
+        << " ctrlRx="
+        << controlPacketsReceived_.load(
+            std::memory_order_relaxed
+        )
+        << " ctrlRxErr="
+        << controlReceiveErrors_.load(
+            std::memory_order_relaxed
+        )
+        << " rtxReq="
+        << retransmitRequests_.load(std::memory_order_relaxed)
+        << " rtxQueued="
+        << retransmitQueued_.load(std::memory_order_relaxed)
+        << " rtxQueueDrop="
+        << retransmitQueueDropped_.load(std::memory_order_relaxed)
+        << " rtxRateLimited="
+        << retransmitRateLimited_.load(std::memory_order_relaxed)
+        << " rtxSent="
+        << retransmitPacketsSent_.load(std::memory_order_relaxed)
+        << " rtxSendFail="
+        << retransmitSendFailures_.load(std::memory_order_relaxed)
+        << " rtxMaxQueue="
+        << maxRetransmitQueueSeen_.load(std::memory_order_relaxed)
+        << " rtxMaxQueueLatencyMs="
+        << maxRetransmitQueueLatencyMs_.load(std::memory_order_relaxed)
         << "\n";
 }
 
@@ -491,7 +806,12 @@ void RealtimeRtpSender::drainIncomingControlPackets()
     for (int i = 0; i < 8; i++) {
         uint8_t buffer[1500] {};
         sockaddr_in from {};
+        
+        #if defined(_WIN32)
         int fromLen = sizeof(from);
+        #else
+        socklen_t fromLen = sizeof(from);
+        #endif
 
         const int received = recvfrom(
             socket_,
@@ -503,16 +823,29 @@ void RealtimeRtpSender::drainIncomingControlPackets()
         );
 
         if (received <= 0) {
-            const int error = WSAGetLastError();
+            const int error = lastSocketError();
 
-            if (error == WSAEWOULDBLOCK) {
+            if (socketWouldBlock(error)) {
                 return;
             }
+
+            controlReceiveErrors_.fetch_add(
+                1,
+                std::memory_order_relaxed
+            );
 
             return;
         }
 
-        handleIncomingControlPacket(buffer, received);
+        controlPacketsReceived_.fetch_add(
+            1,
+            std::memory_order_relaxed
+        );
+
+        handleIncomingControlPacket(
+            buffer,
+            received
+        );
     }
 }
 
@@ -525,24 +858,41 @@ void RealtimeRtpSender::handleIncomingControlPacket(
         return;
     }
 
-    const uint8_t version = data[0] >> 6;
-    const uint8_t fmt = data[0] & 0x1f;
-    const uint8_t packetType = data[1];
+    int offset = 0;
 
-    if (version != 2) {
-        return;
-    }
+    while (offset + 4 <= size) {
+        const uint8_t* packet = data + offset;
+        const int remaining = size - offset;
 
-    // RTCP Transport Feedback, Generic NACK
-    if (packetType == 205 && fmt == 1) {
-        handleRtcpGenericNack(data, size);
-        return;
-    }
+        const uint8_t version = packet[0] >> 6;
+        const uint8_t fmt = packet[0] & 0x1f;
+        const uint8_t packetType = packet[1];
 
-    // RTCP Transport Feedback, Transport-Wide CC
-    if (packetType == 205 && fmt == 15) {
-        handleRtcpTransportWideFeedback(data, size);
-        return;
+        if (version != 2) {
+            return;
+        }
+
+        const uint16_t rtcpLengthWords =
+            static_cast<uint16_t>((packet[2] << 8) | packet[3]);
+
+        const int packetSize =
+            static_cast<int>((rtcpLengthWords + 1) * 4);
+
+        if (packetSize < 4 || packetSize > remaining) {
+            return;
+        }
+
+        // RTCP Transport Feedback, Generic NACK
+        if (packetType == 205 && fmt == 1) {
+            handleRtcpGenericNack(packet, packetSize);
+        }
+
+        // RTCP Transport Feedback, Transport-Wide CC
+        if (packetType == 205 && fmt == 15) {
+            handleRtcpTransportWideFeedback(packet, packetSize);
+        }
+
+        offset += packetSize;
     }
 }
 
@@ -560,23 +910,40 @@ void RealtimeRtpSender::handleRtcpGenericNack(
 
     const int packetSize = static_cast<int>((rtcpLengthWords + 1) * 4);
 
-    if (packetSize > size || packetSize < 16) {
+    if (packetSize > size || packetSize < 4) {
+        return;
+    }
+
+    int effectivePacketSize = packetSize;
+
+    if ((data[0] & 0x20) != 0) {
+        const uint8_t paddingBytes = data[packetSize - 1];
+
+        if (paddingBytes == 0 ||
+            paddingBytes > packetSize - 4) {
+            return;
+        }
+
+        effectivePacketSize -= paddingBytes;
+    }
+
+    if (effectivePacketSize < 16) {
         return;
     }
 
     const uint32_t mediaSsrc =
-        (static_cast<uint32_t>(data[12]) << 24) |
-        (static_cast<uint32_t>(data[13]) << 16) |
-        (static_cast<uint32_t>(data[14]) << 8) |
-        static_cast<uint32_t>(data[15]);
+        (static_cast<uint32_t>(data[8]) << 24) |
+        (static_cast<uint32_t>(data[9]) << 16) |
+        (static_cast<uint32_t>(data[10]) << 8) |
+        static_cast<uint32_t>(data[11]);
 
     if (mediaSsrc != ssrc_) {
         return;
     }
 
-    int offset = 16;
+    int offset = 12;
 
-    while (offset + 4 <= packetSize) {
+    while (offset + 4 <= effectivePacketSize) {
         const uint16_t pid =
             static_cast<uint16_t>((data[offset] << 8) | data[offset + 1]);
 
@@ -625,25 +992,42 @@ void RealtimeRtpSender::handleRtcpTransportWideFeedback(
 
     const int packetSize = static_cast<int>((rtcpLengthWords + 1) * 4);
 
-    if (packetSize > size || packetSize < 20) {
+    if (packetSize > size || packetSize < 4) {
+        return;
+    }
+
+    int effectivePacketSize = packetSize;
+
+    if ((data[0] & 0x20) != 0) {
+        const uint8_t paddingBytes = data[packetSize - 1];
+
+        if (paddingBytes == 0 ||
+            paddingBytes > packetSize - 4) {
+            return;
+        }
+
+        effectivePacketSize -= paddingBytes;
+    }
+
+    if (effectivePacketSize < 20) {
         return;
     }
 
     const uint32_t mediaSsrc =
-        (static_cast<uint32_t>(data[12]) << 24) |
-        (static_cast<uint32_t>(data[13]) << 16) |
-        (static_cast<uint32_t>(data[14]) << 8) |
-        static_cast<uint32_t>(data[15]);
+        (static_cast<uint32_t>(data[8]) << 24) |
+        (static_cast<uint32_t>(data[9]) << 16) |
+        (static_cast<uint32_t>(data[10]) << 8) |
+        static_cast<uint32_t>(data[11]);
 
     if (mediaSsrc != ssrc_) {
         return;
     }
 
     const uint16_t baseSequence =
-        static_cast<uint16_t>((data[16] << 8) | data[17]);
+        static_cast<uint16_t>((data[12] << 8) | data[13]);
 
     const uint16_t packetStatusCount =
-        static_cast<uint16_t>((data[18] << 8) | data[19]);
+        static_cast<uint16_t>((data[14] << 8) | data[15]);
 
     if (STREAM_DEBUG_RTCP_TWCC) {
         std::cerr << "[RTCP] TWCC feedback"
@@ -695,9 +1079,10 @@ bool RealtimeRtpSender::writeRtpPacketToSlot(
     slot.data[11] = static_cast<uint8_t>(ssrc_ & 0xff);
 
     if (useTwcc) {
-        const uint16_t twccSequenceNumber = twccSequenceNumber_.fetch_add(1);
-
-        // RTP one-byte header extension profile: 0xBEDE
+        // RTP one-byte header extension profile: 0xBEDE.
+        // The transport-wide sequence value itself is assigned by the
+        // sender thread immediately before send so media and future RTX
+        // packets share one wire-order sequence space.
         slot.data[12] = 0xBE;
         slot.data[13] = 0xDE;
 
@@ -710,8 +1095,9 @@ bool RealtimeRtpSender::writeRtpPacketToSlot(
         // TWCC payload is 2 bytes, so len - 1 = 1.
         slot.data[16] = static_cast<uint8_t>((TWCC_EXTENSION_ID << 4) | 0x01);
 
-        slot.data[17] = static_cast<uint8_t>((twccSequenceNumber >> 8) & 0xff);
-        slot.data[18] = static_cast<uint8_t>(twccSequenceNumber & 0xff);
+        // Placeholder; senderLoop assigns the real transport sequence.
+        slot.data[17] = 0x00;
+        slot.data[18] = 0x00;
 
         // Padding to complete 32-bit extension word.
         slot.data[19] = 0x00;
@@ -824,9 +1210,7 @@ bool RealtimeRtpSender::enqueueRtpPacket(
     ) {
     }
 
-    if (packetAvailableEvent_) {
-        SetEvent(packetAvailableEvent_);
-    }
+    signalSender();
 
     return true;
 }
@@ -854,10 +1238,74 @@ bool RealtimeRtpSender::sendH264Nal(
     
     const bool useTwcc = label_ == "video";
     const size_t rtpHeaderSize = useTwcc ? RTP_TWCC_HEADER_SIZE : RTP_HEADER_SIZE;
-    const size_t maxPayloadSize = MAX_RTP_PACKET_SIZE - rtpHeaderSize;
+    const size_t retransmitHeadroom = useTwcc ? RTX_OSN_SIZE : 0;
+    const size_t maxPayloadSize =
+        MAX_RTP_PACKET_SIZE - rtpHeaderSize - retransmitHeadroom;
 
     if (size <= maxPayloadSize) {
         return enqueueRtpPacket(data, size, timestamp, marker);
+    }
+
+    const size_t fragmentPayloadSize =
+        maxPayloadSize - 2;
+
+    const size_t payloadBytesToFragment =
+        size - 1;
+
+    const uint64_t requiredFragments =
+        static_cast<uint64_t>(
+            (
+                payloadBytesToFragment +
+                fragmentPayloadSize - 1
+            ) /
+            fragmentPayloadSize
+        );
+
+    const uint64_t writeSeq =
+        publishSequence_.load(
+            std::memory_order_relaxed
+        );
+
+    const uint64_t readSeq =
+        consumeSequence_.load(
+            std::memory_order_acquire
+        );
+
+    const uint64_t queueSize =
+        writeSeq - readSeq;
+
+    const uint64_t usableCapacity =
+        RING_SIZE - 1;
+
+    const uint64_t freeSlots =
+        usableCapacity > queueSize
+            ? usableCapacity - queueSize
+            : 0;
+
+    if (requiredFragments > freeSlots) {
+        fragmentedNalAdmissionDrops_.fetch_add(
+            1,
+            std::memory_order_relaxed
+        );
+
+        static thread_local uint64_t nalAdmissionDropLogCounter = 0;
+        nalAdmissionDropLogCounter++;
+
+        if (nalAdmissionDropLogCounter % 100 == 1) {
+            std::cerr
+                << "[Realtime RTP Sender:"
+                << label_
+                << "] fragmented NAL rejected before enqueue"
+                << " requiredFragments=" << requiredFragments
+                << " freeSlots=" << freeSlots
+                << " queue=" << queueSize
+                << " capacity=" << usableCapacity
+                << " nalBytes=" << size
+                << " timestamp=" << timestamp
+                << "\n";
+        }
+
+        return false;
     }
 
     const uint8_t nalHeader = data[0];
@@ -933,13 +1381,36 @@ void RealtimeRtpSender::storeHistoryPacket(const RtpPacket& packet)
     historyPacketsStored_.fetch_add(1, std::memory_order_relaxed);
 }
 
-bool RealtimeRtpSender::shouldSuppressRetransmit(
-    uint16_t rtpSequenceNumber
+bool RealtimeRtpSender::isRetransmitSuppressed(
+    uint16_t rtpSequenceNumber,
+    std::chrono::steady_clock::time_point now
+) const
+{
+    for (size_t i = 0; i < lastRetransmitSeqs_.size(); ++i) {
+        if (lastRetransmitSeqs_[i] != rtpSequenceNumber) {
+            continue;
+        }
+
+        const auto previous = lastRetransmitTimes_[i];
+
+        return (
+            previous.time_since_epoch().count() != 0 &&
+            now - previous < RTX_SUPPRESSION_WINDOW
+        );
+    }
+
+    return false;
+}
+
+void RealtimeRtpSender::rememberRetransmit(
+    uint16_t rtpSequenceNumber,
+    std::chrono::steady_clock::time_point now
 )
 {
-    for (const uint16_t seq : lastRetransmitSeqs_) {
-        if (seq == rtpSequenceNumber) {
-            return true;
+    for (size_t i = 0; i < lastRetransmitSeqs_.size(); ++i) {
+        if (lastRetransmitSeqs_[i] == rtpSequenceNumber) {
+            lastRetransmitTimes_[i] = now;
+            return;
         }
     }
 
@@ -948,39 +1419,252 @@ bool RealtimeRtpSender::shouldSuppressRetransmit(
         std::memory_order_relaxed
     );
 
-    lastRetransmitSeqs_[index % RTX_SUPPRESSION_SIZE] = rtpSequenceNumber;
+    const size_t slot = index % RTX_SUPPRESSION_SIZE;
 
-    return false;
+    lastRetransmitSeqs_[slot] = rtpSequenceNumber;
+    lastRetransmitTimes_[slot] = now;
 }
 
-bool RealtimeRtpSender::retransmitPacket(uint16_t rtpSequenceNumber)
+void RealtimeRtpSender::signalSender()
 {
-    if (!running_ || socket_ == INVALID_SOCKET) {
+    #if defined(_WIN32)
+
+    if (packetAvailableEvent_) {
+        SetEvent(packetAvailableEvent_);
+    }
+
+    #else
+
+    if (packetAvailableEventFd_ >= 0) {
+        const uint64_t signal = 1;
+
+        const ssize_t written = ::write(
+            packetAvailableEventFd_,
+            &signal,
+            sizeof(signal)
+        );
+
+        (void)written;
+    }
+
+    #endif
+}
+
+bool RealtimeRtpSender::enqueueRetransmitRequest(
+    uint16_t rtpSequenceNumber
+)
+{
+    const uint64_t writeSeq =
+        retransmitPublishSequence_.load(std::memory_order_relaxed);
+
+    const uint64_t readSeq =
+        retransmitConsumeSequence_.load(std::memory_order_acquire);
+
+    const uint64_t queueSize = writeSeq - readSeq;
+
+    if (queueSize >= RETRANSMIT_PENDING_SIZE - 1) {
+        retransmitQueueDropped_.fetch_add(
+            1,
+            std::memory_order_relaxed
+        );
+
+        return false;
+    }
+    PendingRetransmit& pending =
+        pendingRetransmits_[writeSeq % RETRANSMIT_PENDING_SIZE];
+
+    pending.rtpSequenceNumber = rtpSequenceNumber;
+    pending.sequence = writeSeq;
+    pending.enqueuedAt = std::chrono::steady_clock::now();
+
+    retransmitPublishSequence_.store(
+        writeSeq + 1,
+        std::memory_order_release
+    );
+
+    retransmitQueued_.fetch_add(1, std::memory_order_relaxed);
+
+    const uint32_t currentQueue =
+        static_cast<uint32_t>(queueSize + 1);
+
+    uint32_t previousMax =
+        maxRetransmitQueueSeen_.load(std::memory_order_relaxed);
+
+    while (
+        currentQueue > previousMax &&
+        !maxRetransmitQueueSeen_.compare_exchange_weak(
+            previousMax,
+            currentQueue,
+            std::memory_order_relaxed
+        )
+    ) {
+    }
+
+    signalSender();
+    return true;
+}
+
+bool RealtimeRtpSender::serviceOnePendingRetransmit(
+    std::chrono::steady_clock::time_point& nextSendTime,
+    uint32_t mediaQueueDepth
+)
+{
+    using clock = std::chrono::steady_clock;
+
+    const uint64_t readSeq =
+        retransmitConsumeSequence_.load(std::memory_order_relaxed);
+
+    const uint64_t writeSeq =
+        retransmitPublishSequence_.load(std::memory_order_acquire);
+
+    if (readSeq == writeSeq) {
         return false;
     }
 
-    if (shouldSuppressRetransmit(rtpSequenceNumber)) {
-        return false;
+    const PendingRetransmit& pending =
+        pendingRetransmits_[readSeq % RETRANSMIT_PENDING_SIZE];
+
+    bool sendAttempted = false;
+    bool sent = false;
+    bool historyMissed = false;
+
+    if (pending.sequence == readSeq) {
+        const auto latencyMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                clock::now() - pending.enqueuedAt
+            ).count();
+
+        if (latencyMs >= 0) {
+            const uint32_t latency = static_cast<uint32_t>(latencyMs);
+            uint32_t previousMax =
+                maxRetransmitQueueLatencyMs_.load(std::memory_order_relaxed);
+
+            while (
+                latency > previousMax &&
+                !maxRetransmitQueueLatencyMs_.compare_exchange_weak(
+                    previousMax,
+                    latency,
+                    std::memory_order_relaxed
+                )
+            ) {
+            }
+        }
+
+        const uint16_t rtpSequenceNumber = pending.rtpSequenceNumber;
+        const HistoryPacket& slot =
+            history_[rtpSequenceNumber % HISTORY_SIZE];
+
+        if (
+            slot.valid &&
+            slot.rtpSequenceNumber == rtpSequenceNumber &&
+            slot.size > 0
+        ) {
+            RtpPacket packet {};
+
+            if (buildRetransmitPacket(slot, packet)) {
+                const uint32_t queueDepth = static_cast<uint32_t>(
+                    (writeSeq - readSeq) + mediaQueueDepth
+                );
+
+                pacingCalls_.fetch_add(1, std::memory_order_relaxed);
+
+                // RTX consumes the same active peak / virtual-departure
+                // budget as media. Sustained accounting remains media-only.
+                pacer_.pace(
+                    senderThreadRunning_,
+                    true,
+                    queueDepth,
+                    packet.size,
+                    nextSendTime,
+                    false
+                );
+
+                // TWCC belongs to the actual transport send order. Both
+                // fresh media and retransmissions consume the same sequence
+                // space on the video socket.
+                assignTransportWideSequenceNumber(packet);
+
+                sendAttempted = true;
+                sent = sendRawPacketInternal(packet, false);
+            }
+        } else {
+            historyMissed = true;
+        }
     }
 
-    const auto now = std::chrono::steady_clock::now();
+    retransmitConsumeSequence_.store(
+        readSeq + 1,
+        std::memory_order_release
+    );
 
+    if (sent) {
+        retransmitPacketsSent_.fetch_add(1, std::memory_order_relaxed);
+        historyPacketsRetransmitted_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        if (sendAttempted) {
+            retransmitSendFailures_.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        if (historyMissed) {
+            historyPacketsMissed_.fetch_add(1, std::memory_order_relaxed);
+        }
+
+    }
+
+    return true;
+}
+
+bool RealtimeRtpSender::consumeRetransmitBudget(
+    std::chrono::steady_clock::time_point now
+)
+{
     if (
         retransmitWindowStartedAt_.time_since_epoch().count() == 0 ||
         now - retransmitWindowStartedAt_ >= std::chrono::seconds(1)
     ) {
         retransmitWindowStartedAt_ = now;
-        retransmitsThisSecond_ = 0;
+
+        retransmitsThisSecond_.store(
+            0,
+            std::memory_order_relaxed
+        );
     }
 
     constexpr uint32_t MAX_RETRANSMITS_PER_SECOND = 300;
 
-    if (retransmitsThisSecond_.fetch_add(1, std::memory_order_relaxed) >= MAX_RETRANSMITS_PER_SECOND) {
-        historyPacketsMissed_.fetch_add(1, std::memory_order_relaxed);
+    if (
+        retransmitsThisSecond_.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) >= MAX_RETRANSMITS_PER_SECOND
+    ) {
+        retransmitRateLimited_.fetch_add(
+            1,
+            std::memory_order_relaxed
+        );
+
         return false;
     }
 
-    const HistoryPacket& slot = history_[rtpSequenceNumber % HISTORY_SIZE];
+    return true;
+}
+
+bool RealtimeRtpSender::retransmitPacket(uint16_t rtpSequenceNumber)
+{
+    retransmitRequests_.fetch_add(1, std::memory_order_relaxed);
+
+    if (!running_ || socket_ == INVALID_SOCKET) {
+        return false;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+
+    if (isRetransmitSuppressed(rtpSequenceNumber, now)) {
+        return false;
+    }
+
+    const HistoryPacket& slot =
+        history_[rtpSequenceNumber % HISTORY_SIZE];
 
     if (
         !slot.valid ||
@@ -989,46 +1673,56 @@ bool RealtimeRtpSender::retransmitPacket(uint16_t rtpSequenceNumber)
     ) {
         historyPacketsMissed_.fetch_add(1, std::memory_order_relaxed);
         return false;
+    } 
+
+    if (!consumeRetransmitBudget(now)) {
+        return false;
     }
 
-    RtpPacket packet {};
-    std::copy(
-        slot.data.begin(),
-        slot.data.begin() + slot.size,
-        packet.data.begin()
-    );
-
-    packet.size = slot.size;
-
-    const bool ok = rtxEnabled_
-        ? sendRtxPacket(slot)
-        : sendRawPacketInternal(packet, false);
-
-    if (ok) {
-        historyPacketsRetransmitted_.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        historyPacketsMissed_.fetch_add(1, std::memory_order_relaxed);
+    if (!enqueueRetransmitRequest(rtpSequenceNumber)) {
+        return false;
     }
 
-    return ok;
+    rememberRetransmit(rtpSequenceNumber, now);
+
+    return true;
 }
 
-bool RealtimeRtpSender::sendRtxPacket(const HistoryPacket& slot)
+bool RealtimeRtpSender::buildRetransmitPacket(
+    const HistoryPacket& slot,
+    RtpPacket& packet
+)
 {
-    const size_t ORIGINAL_RTP_HEADER_SIZE =
-        (label_ == "video") ? RTP_TWCC_HEADER_SIZE : RTP_HEADER_SIZE;
-    static constexpr size_t RTX_HEADER_SIZE = RTP_HEADER_SIZE;
-    static constexpr size_t OSN_SIZE = 2;
+    if (!rtxEnabled_) {
+        if (slot.size == 0 || slot.size > MAX_RTP_PACKET_SIZE) {
+            return false;
+        }
 
-    if (slot.size <= ORIGINAL_RTP_HEADER_SIZE) {
+        std::copy(
+            slot.data.begin(),
+            slot.data.begin() + slot.size,
+            packet.data.begin()
+        );
+
+        packet.size = slot.size;
+        return true;
+    }
+
+    const bool useTwcc = label_ == "video";
+    const size_t originalRtpHeaderSize =
+        useTwcc ? RTP_TWCC_HEADER_SIZE : RTP_HEADER_SIZE;
+    const size_t rtxRtpHeaderSize =
+        useTwcc ? RTP_TWCC_HEADER_SIZE : RTP_HEADER_SIZE;
+
+    if (slot.size <= originalRtpHeaderSize) {
         return false;
     }
 
     const size_t originalPayloadSize =
-        static_cast<size_t>(slot.size) - ORIGINAL_RTP_HEADER_SIZE;
+        static_cast<size_t>(slot.size) - originalRtpHeaderSize;
 
     const size_t rtxPacketSize =
-        RTX_HEADER_SIZE + OSN_SIZE + originalPayloadSize;
+        rtxRtpHeaderSize + RTX_OSN_SIZE + originalPayloadSize;
 
     if (rtxPacketSize > MAX_RTP_PACKET_SIZE) {
         return false;
@@ -1043,45 +1737,85 @@ bool RealtimeRtpSender::sendRtxPacket(const HistoryPacket& slot)
         (static_cast<uint32_t>(slot.data[6]) << 8) |
         static_cast<uint32_t>(slot.data[7]);
 
-    RtpPacket rtxPacket {};
-    rtxPacket.size = static_cast<uint16_t>(rtxPacketSize);
+    packet = {};
+    packet.size = static_cast<uint16_t>(rtxPacketSize);
 
     const uint16_t rtxSequenceNumber =
         rtxSequenceNumber_.fetch_add(1);
 
-    rtxPacket.data[0] = 0x80;
-    rtxPacket.data[1] = static_cast<uint8_t>(
+    packet.data[0] = useTwcc ? 0x90 : 0x80;
+    packet.data[1] = static_cast<uint8_t>(
         (originalMarker ? 0x80 : 0x00) | rtxPayloadType_
     );
 
-    rtxPacket.data[2] = static_cast<uint8_t>((rtxSequenceNumber >> 8) & 0xff);
-    rtxPacket.data[3] = static_cast<uint8_t>(rtxSequenceNumber & 0xff);
+    packet.data[2] = static_cast<uint8_t>((rtxSequenceNumber >> 8) & 0xff);
+    packet.data[3] = static_cast<uint8_t>(rtxSequenceNumber & 0xff);
 
-    rtxPacket.data[4] = static_cast<uint8_t>((originalTimestamp >> 24) & 0xff);
-    rtxPacket.data[5] = static_cast<uint8_t>((originalTimestamp >> 16) & 0xff);
-    rtxPacket.data[6] = static_cast<uint8_t>((originalTimestamp >> 8) & 0xff);
-    rtxPacket.data[7] = static_cast<uint8_t>(originalTimestamp & 0xff);
+    packet.data[4] = static_cast<uint8_t>((originalTimestamp >> 24) & 0xff);
+    packet.data[5] = static_cast<uint8_t>((originalTimestamp >> 16) & 0xff);
+    packet.data[6] = static_cast<uint8_t>((originalTimestamp >> 8) & 0xff);
+    packet.data[7] = static_cast<uint8_t>(originalTimestamp & 0xff);
 
-    rtxPacket.data[8] = static_cast<uint8_t>((rtxSsrc_ >> 24) & 0xff);
-    rtxPacket.data[9] = static_cast<uint8_t>((rtxSsrc_ >> 16) & 0xff);
-    rtxPacket.data[10] = static_cast<uint8_t>((rtxSsrc_ >> 8) & 0xff);
-    rtxPacket.data[11] = static_cast<uint8_t>(rtxSsrc_ & 0xff);
+    packet.data[8] = static_cast<uint8_t>((rtxSsrc_ >> 24) & 0xff);
+    packet.data[9] = static_cast<uint8_t>((rtxSsrc_ >> 16) & 0xff);
+    packet.data[10] = static_cast<uint8_t>((rtxSsrc_ >> 8) & 0xff);
+    packet.data[11] = static_cast<uint8_t>(rtxSsrc_ & 0xff);
 
-    // OSN (Original Sequence Number), buyuk-endian.
-    rtxPacket.data[12] = static_cast<uint8_t>(
+    if (useTwcc) {
+        packet.data[12] = 0xBE;
+        packet.data[13] = 0xDE;
+        packet.data[14] = 0x00;
+        packet.data[15] = 0x01;
+        packet.data[16] = static_cast<uint8_t>(
+            (TWCC_EXTENSION_ID << 4) | 0x01
+        );
+
+        // Placeholder. serviceOnePendingRetransmit() assigns a fresh
+        // transport-wide sequence immediately before the socket send.
+        packet.data[17] = 0x00;
+        packet.data[18] = 0x00;
+        packet.data[19] = 0x00;
+    }
+
+    // OSN (Original Sequence Number), big-endian. It lives at the start of
+    // the RTX payload, after any RTP header extensions.
+    packet.data[rtxRtpHeaderSize] = static_cast<uint8_t>(
         (slot.rtpSequenceNumber >> 8) & 0xff
     );
-    rtxPacket.data[13] = static_cast<uint8_t>(
+    packet.data[rtxRtpHeaderSize + 1] = static_cast<uint8_t>(
         slot.rtpSequenceNumber & 0xff
     );
 
     std::copy(
-        slot.data.begin() + ORIGINAL_RTP_HEADER_SIZE,
+        slot.data.begin() + originalRtpHeaderSize,
         slot.data.begin() + slot.size,
-        rtxPacket.data.begin() + RTX_HEADER_SIZE + OSN_SIZE
+        packet.data.begin() + rtxRtpHeaderSize + RTX_OSN_SIZE
     );
 
-    return sendRawPacketInternal(rtxPacket, false);
+    return true;
+}
+
+void RealtimeRtpSender::assignTransportWideSequenceNumber(
+    RtpPacket& packet
+)
+{
+    if (
+        label_ != "video" ||
+        packet.size < RTP_TWCC_HEADER_SIZE ||
+        (packet.data[0] & 0x10) == 0
+    ) {
+        return;
+    }
+
+    const uint16_t twccSequenceNumber =
+        twccSequenceNumber_.fetch_add(1, std::memory_order_relaxed);
+
+    packet.data[17] = static_cast<uint8_t>(
+        (twccSequenceNumber >> 8) & 0xff
+    );
+    packet.data[18] = static_cast<uint8_t>(
+        twccSequenceNumber & 0xff
+    );
 }
 
 bool RealtimeRtpSender::sendRawPacketInternal(
@@ -1092,6 +1826,8 @@ bool RealtimeRtpSender::sendRawPacketInternal(
     if (!running_ || socket_ == INVALID_SOCKET || packet.size == 0) {
         return false;
     }
+
+    #if defined(_WIN32)
 
     WSABUF buffer {};
     buffer.buf = reinterpret_cast<char*>(
@@ -1116,10 +1852,40 @@ bool RealtimeRtpSender::sendRawPacketInternal(
         sendFailures_.fetch_add(1, std::memory_order_relaxed);
         std::cerr << "[Realtime RTP Sender:" << label_
                   << "] WSASend failed: "
-                  << WSAGetLastError()
+                  << lastSocketError()
                   << "\n";
         return false;
     }
+
+    #else
+
+        const ssize_t sendResult = ::send(
+        socket_,
+        packet.data.data(),
+        packet.size,
+        0
+    );
+
+    if (sendResult < 0) {
+        sendFailures_.fetch_add(
+            1,
+            std::memory_order_relaxed
+        );
+
+        std::cerr
+            << "[Realtime RTP Sender:"
+            << label_
+            << "] send failed: "
+            << lastSocketError()
+            << "\n";
+
+        return false;
+    }
+
+    const size_t bytesSent =
+        static_cast<size_t>(sendResult);
+
+    #endif
 
     if (bytesSent != packet.size) {
         partialSends_.fetch_add(1, std::memory_order_relaxed);
@@ -1131,16 +1897,19 @@ bool RealtimeRtpSender::sendRawPacketInternal(
         return false;
     }
 
-    packetsSent_.fetch_add(1, std::memory_order_relaxed);
-    bytesSent_.fetch_add(packet.size, std::memory_order_relaxed);
+    wirePacketsSent_.fetch_add(1, std::memory_order_relaxed);
+    wireBytesSent_.fetch_add(packet.size, std::memory_order_relaxed);
+
+    if (storeHistory) {
+        packetsSent_.fetch_add(1, std::memory_order_relaxed);
+        bytesSent_.fetch_add(packet.size, std::memory_order_relaxed);
+    }
 
     if (label_ == "video") {
         static std::atomic<int64_t> windowBytes{ 0 };
         static auto windowStart = std::chrono::steady_clock::now();
         static constexpr int64_t kWindowMs = 100;
-        // 8 Mbps / 8 = 1,000,000 byte/sn -> 100ms'de ~100,000 byte beklenir.
-        static constexpr int64_t kExpectedBytesPerWindow = 100000;
-
+        
         windowBytes.fetch_add(packet.size, std::memory_order_relaxed);
 
         const auto now = std::chrono::steady_clock::now();
@@ -1155,18 +1924,38 @@ bool RealtimeRtpSender::sendRawPacketInternal(
 
             windowStart = now;
 
-            if (actualBytes > kExpectedBytesPerWindow * 2) {
-                const double instantMbps =
-                    (static_cast<double>(actualBytes) * 8.0) /
-                    (static_cast<double>(elapsedMs) / 1000.0) /
-                    1000000.0;
+            const BitrateDecision bitrateDecision =
+                pacer_.bitrateDecision();
 
-                std::cerr
-                    << "[Realtime RTP Sender:video] burst-check"
-                    << " windowMs=" << elapsedMs
-                    << " bytes=" << actualBytes
-                    << " instantMbps=" << instantMbps
-                    << "\n";
+            const uint32_t targetBitrateBps =
+                bitrateDecision.targetBitrateBps;
+
+            if (targetBitrateBps > 0) {
+                const uint64_t expectedBytes =
+                    (static_cast<uint64_t>(targetBitrateBps) *
+                    static_cast<uint64_t>(elapsedMs)) /
+                    8000ULL;
+
+                if (
+                    static_cast<uint64_t>(actualBytes) >
+                    expectedBytes * 2ULL
+                ) {
+                    const double instantMbps =
+                        (static_cast<double>(actualBytes) * 8.0) /
+                        (static_cast<double>(elapsedMs) / 1000.0) /
+                        1000000.0;
+
+                    std::cerr
+                        << "[Realtime RTP Sender:video] burst-check"
+                        << " windowMs=" << elapsedMs
+                        << " bytes=" << actualBytes
+                        << " expectedBytes=" << expectedBytes
+                        << " targetMbps="
+                        << (static_cast<double>(targetBitrateBps) /
+                            1000000.0)
+                        << " instantMbps=" << instantMbps
+                        << "\n";
+                }
             }
         }
     }
@@ -1202,6 +1991,8 @@ void RealtimeRtpSender::flushPacketBatch(const PacketBatch& batch)
 
 void RealtimeRtpSender::senderLoop()
 {
+    #if defined(_WIN32)
+
     DWORD priority = THREAD_PRIORITY_ABOVE_NORMAL;
 
     if (!SetThreadPriority(GetCurrentThread(), priority)) {
@@ -1216,6 +2007,8 @@ void RealtimeRtpSender::senderLoop()
                   << "\n";
     }
 
+    #endif
+
     using clock = std::chrono::steady_clock;
 
     auto nextStatsLog = clock::now() + std::chrono::seconds(10);
@@ -1225,7 +2018,7 @@ void RealtimeRtpSender::senderLoop()
     uint32_t packetsSentInWindow = 0;
 
     constexpr uint32_t MAX_BATCH_PACKETS = 1;
-    constexpr uint32_t VIDEO_SOFT_BATCH_PACKETS = 4;
+    constexpr uint32_t VIDEO_SOFT_BATCH_PACKETS = 1;
     constexpr uint32_t AUDIO_SOFT_BATCH_PACKETS = 1;
     
     pacer_.logBaseline(label_, MAX_BATCH_PACKETS);
@@ -1238,6 +2031,13 @@ void RealtimeRtpSender::senderLoop()
         drainIncomingControlPackets();
         const uint64_t readSeq = consumeSequence_.load(std::memory_order_relaxed);
         const uint64_t writeSeq = publishSequence_.load(std::memory_order_acquire);
+        const uint64_t rtxReadSeq =
+            retransmitConsumeSequence_.load(std::memory_order_relaxed);
+        const uint64_t rtxWriteSeq =
+            retransmitPublishSequence_.load(std::memory_order_acquire);
+
+        const bool hasMedia = readSeq != writeSeq;
+        const bool hasPendingRetransmit = rtxReadSeq != rtxWriteSeq;
 
         const bool shouldContinueRunning =
             senderThreadRunning_.load(
@@ -1246,16 +2046,19 @@ void RealtimeRtpSender::senderLoop()
 
         if (
             !shouldContinueRunning &&
-            readSeq == writeSeq
+            !hasMedia &&
+            !hasPendingRetransmit
         ) {
             break;
         }
 
-        if (readSeq == writeSeq) {
+        if (!hasMedia && !hasPendingRetransmit) {
             emptyQueueWaits_.fetch_add(
                 1,
                 std::memory_order_relaxed
             );
+
+            #if defined(_WIN32)
 
             if (
                 label_ == "video" &&
@@ -1336,12 +2139,156 @@ void RealtimeRtpSender::senderLoop()
                     std::memory_order_relaxed
                 );
             }
+
+            #else
+
+            if (packetAvailableEventFd_ < 0) {
+                emptyQueueWaitErrors_.fetch_add(
+                    1,
+                    std::memory_order_relaxed
+                );
+
+                std::this_thread::yield();
+
+                nextSendTime = clock::now();
+                continue;
+            }
+
+            struct pollfd fds[2] {};
+            nfds_t fdCount = 0;
+
+            const nfds_t queueEventIndex = fdCount;
+
+            fds[fdCount].fd =
+                packetAvailableEventFd_;
+
+            fds[fdCount].events =
+                POLLIN;
+
+            fdCount++;
+
+            nfds_t socketIndex = 0;
+            bool watchSocket = false;
+
+            if (
+                label_ == "video" &&
+                socket_ != INVALID_SOCKET
+            ) {
+                socketIndex = fdCount;
+
+                fds[fdCount].fd =
+                    socket_;
+
+                fds[fdCount].events =
+                    POLLIN;
+
+                fdCount++;
+
+                watchSocket = true;
+            }
+
+            const int pollResult =
+                ::poll(
+                    fds,
+                    fdCount,
+                    -1
+                );
+
+            if (pollResult > 0) {
+
+                if (
+                    fds[queueEventIndex].revents &
+                    POLLIN
+                ) {
+                    uint64_t signalCount = 0;
+
+                    const ssize_t readResult =
+                        ::read(
+                            packetAvailableEventFd_,
+                            &signalCount,
+                            sizeof(signalCount)
+                        );
+
+                    if (
+                        readResult ==
+                        static_cast<ssize_t>(
+                            sizeof(signalCount)
+                        )
+                    ) {
+                        emptyQueueSignals_.fetch_add(
+                            1,
+                            std::memory_order_relaxed
+                        );
+                    }
+                }
+
+                if (
+                    watchSocket &&
+                    (
+                        fds[socketIndex].revents &
+                        POLLIN
+                    )
+                ) {
+                    drainIncomingControlPackets();
+                }
+
+                bool pollFdError = false;
+
+                if (
+                    fds[queueEventIndex].revents &
+                    (POLLERR | POLLHUP | POLLNVAL)
+                ) {
+                    pollFdError = true;
+                }
+
+                if (
+                    watchSocket &&
+                    (
+                        fds[socketIndex].revents &
+                        (POLLERR | POLLHUP | POLLNVAL)
+                    )
+                ) {
+                    pollFdError = true;
+                }
+
+                if (pollFdError) {
+                    emptyQueueWaitErrors_.fetch_add(
+                        1,
+                        std::memory_order_relaxed
+                    );
+                }
+
+            } else if (pollResult < 0) {
+                if (errno != EINTR) {
+                    emptyQueueWaitErrors_.fetch_add(
+                        1,
+                        std::memory_order_relaxed
+                    );
+                }
+            }
+
+            #endif
+
             nextSendTime = clock::now();
 
             continue;
         }
 
         const uint32_t queueSizeBeforeSend = static_cast<uint32_t>(writeSeq - readSeq);
+
+        // Retransmissions get first service opportunity, but only one per
+        // loop. If fresh media is also queued, it is serviced immediately
+        // afterwards, preventing strict-priority RTX starvation.
+        if (hasPendingRetransmit) {
+            serviceOnePendingRetransmit(
+                nextSendTime,
+                queueSizeBeforeSend
+            );
+
+            if (!hasMedia) {
+                continue;
+            }
+        }
 
         const auto batchNow = clock::now();
 
@@ -1379,7 +2326,7 @@ void RealtimeRtpSender::senderLoop()
 
         for (uint32_t i = 0; i < batchCount; i++) {
 
-            const RtpPacket& packet = ring_[currentReadSeq % RING_SIZE];
+            RtpPacket& packet = ring_[currentReadSeq % RING_SIZE];
 
             if (packet.sequence == currentReadSeq) {
                 const auto latencyMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1416,7 +2363,7 @@ void RealtimeRtpSender::senderLoop()
                     ) {
                     }
 
-                    if (label_ == "video" && latency >= 120) {
+                    if (label_ == "video" && latency >= 50) {
                         static thread_local auto lastHighLatencyLogAt =
                             clock::time_point{};
 
@@ -1456,15 +2403,15 @@ void RealtimeRtpSender::senderLoop()
             currentReadSeq++;
         }
 
-        flushPacketBatch(batch);
+        uint32_t pacedBytes = 0;
 
-        packetsSentInWindow += batchCount;
-        consumeSequence_.store(currentReadSeq, std::memory_order_release);
-       
-        const uint32_t queueSize = static_cast<uint32_t>(
-            publishSequence_.load(std::memory_order_acquire) -
-            consumeSequence_.load(std::memory_order_acquire)
-        );
+        for (uint32_t i = 0; i < batch.count; i++) {
+            const RtpPacket* packet = batch.packets[i];
+
+            if (packet) {
+                pacedBytes += packet->size;
+            }
+        }
 
         pacingCalls_.fetch_add(
             1,
@@ -1475,7 +2422,29 @@ void RealtimeRtpSender::senderLoop()
             senderThreadRunning_,
             label_ == "video",
             queueSizeBeforeSend,
+            pacedBytes,
             nextSendTime
+        );
+
+        for (uint32_t i = 0; i < batch.count; i++) {
+            RtpPacket* packet = batch.packets[i];
+            if (packet) {
+                assignTransportWideSequenceNumber(*packet);
+            }
+        }
+
+        flushPacketBatch(batch);
+
+        packetsSentInWindow += batchCount;
+
+        consumeSequence_.store(
+            currentReadSeq,
+            std::memory_order_release
+        );
+
+        const uint32_t queueSize = static_cast<uint32_t>(
+            publishSequence_.load(std::memory_order_acquire) -
+            consumeSequence_.load(std::memory_order_acquire)
         );
 
         static thread_local uint64_t queueHighLogCounter = 0;
@@ -1504,6 +2473,8 @@ void RealtimeRtpSender::senderLoop()
                     << " sent=" << packetsSent_.load()
                     << " dropped=" << packetsDropped_.load()
                     << " bytes=" << bytesSent_.load()
+                    << " wireSent=" << wirePacketsSent_.load()
+                    << " wireBytes=" << wireBytesSent_.load()
                     << " queue=" << queueSize
                     << " maxQueue=" << maxQueueSeen_.load()
                     << " avgQueueLatencyMs="

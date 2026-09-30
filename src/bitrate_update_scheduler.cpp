@@ -14,8 +14,7 @@ BitrateUpdateDecision BitrateUpdateScheduler::update(uint32_t targetBitrateBps)
     const auto now = std::chrono::steady_clock::now();
 
     if (lastAppliedBitrateBps_ == 0) {
-        lastAppliedBitrateBps_ = targetBitrateBps;
-        lastAppliedAt_ = now;
+        decision.shouldApply = true;
         return decision;
     }
 
@@ -33,11 +32,19 @@ BitrateUpdateDecision BitrateUpdateScheduler::update(uint32_t targetBitrateBps)
         return decision;
     }
 
-    lastAppliedBitrateBps_ = targetBitrateBps;
-    lastAppliedAt_ = now;
     decision.shouldApply = true;
 
     return decision;
+}
+
+void BitrateUpdateScheduler::markApplied(uint32_t appliedBitrateBps)
+{
+    if (appliedBitrateBps == 0) {
+        return;
+    }
+
+    lastAppliedBitrateBps_ = appliedBitrateBps;
+    lastAppliedAt_ = std::chrono::steady_clock::now();
 }
 
 void BitrateUpdateScheduler::reset()

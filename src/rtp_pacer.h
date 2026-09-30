@@ -1,8 +1,5 @@
 #pragma once
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-
 #include <chrono>
 #include <cstdint>
 #include <atomic>
@@ -52,7 +49,9 @@ public:
         const std::atomic<bool>& shouldRun,
         bool isVideo,
         uint32_t queueDepth,
-        std::chrono::steady_clock::time_point& nextSendTime
+        uint32_t packetBytes,
+        std::chrono::steady_clock::time_point& nextSendTime,
+        bool accountSustained = true
     ) const;
 
     void logBaseline(
@@ -67,6 +66,7 @@ public:
     bool shouldUseAdaptiveVideo() const;
     BitrateDecision bitrateDecision() const;
     void setInitialBitrate(uint32_t bitrateBps);
+    void setAppliedBitrate(uint32_t bitrateBps);
 
     void resetTelemetry();
 
@@ -80,8 +80,50 @@ private:
     NetworkFeedback feedback_{};
     BitrateController bitrateController_;
     BitrateDecision lastBitrateDecision_{};
+
+    std::atomic<uint32_t> targetBitrateBps_{ 0 };
+
+    mutable bool bucketInitialized_{ false };
+
+    mutable std::chrono::steady_clock::time_point bucketLastRefill_{};
+
+    mutable double bucketCreditBytes_{ 0.0 };
+    
+    mutable double bucketMinCreditBytes_{ 0.0 };
+
+    mutable double bucketMaxCreditBytes_{ 0.0 };
+
+    mutable uint32_t bucketRateBps_{ 0 };
+
+    mutable bool peakBucketInitialized_{ false };
+    mutable std::chrono::steady_clock::time_point peakBucketLastRefill_{};
+    mutable double peakBucketCreditBytes_{ 0.0 };
+    mutable double peakBucketMinCreditBytes_{ 0.0 };
+
+    mutable bool peakDebtActive_{ false };
+    mutable std::chrono::steady_clock::time_point peakDebtStart_{};
+    mutable double peakMaxDebtDurationMs_{ 0.0 };
+
+    mutable bool peakVirtualInitialized_{ false };
+
+    mutable std::chrono::steady_clock::time_point
+        peakVirtualTat_{};
+
+    mutable double peakVirtualMaxRequiredWaitMs_{ 0.0 };
+
+    mutable uint64_t peakVirtualWaitEvents_{ 0 };
     
     std::atomic<bool> adaptiveVideoActive_{ false };
     std::atomic<uint32_t> adaptiveVideoExtraUs_{ 0 };
     mutable RtpPacerTelemetry telemetry_{};
+
+    void refillBucketLocked(
+        std::chrono::steady_clock::time_point now
+    ) const;
+
+    void refillPeakBucketLocked(
+        std::chrono::steady_clock::time_point now
+    ) const;
+
+    void resetRateStateLocked(uint32_t bitrateBps);
 };

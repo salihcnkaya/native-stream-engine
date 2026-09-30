@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <iostream>
 #include <new>
+#include <mutex>
 
 namespace {
 
@@ -13,6 +14,7 @@ struct NativeRtpOutputContext {
     obs_output_t* output = nullptr;
     std::atomic<bool> active{ false };
     std::atomic<uint64_t> packetCount{ 0 };
+    std::mutex callbackMutex;
 };
 
 std::atomic<NativeEncodedPacketHandler>
@@ -163,11 +165,19 @@ void stopOutput(
         return;
     }
 
-    const bool wasActive =
-        context->active.exchange(
-            false,
-            std::memory_order_acq_rel
+    bool wasActive = false;
+
+    {
+        std::lock_guard<std::mutex> lock(
+            context->callbackMutex
         );
+
+        wasActive =
+            context->active.exchange(
+                false,
+                std::memory_order_acq_rel
+            );
+    }
 
     if (!wasActive) {
         return;
@@ -198,7 +208,16 @@ void receiveEncodedPacket(
 
     if (
         !context ||
-        !packet ||
+        !packet
+    ) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(
+        context->callbackMutex
+    );
+
+    if (
         !context->active.load(
             std::memory_order_acquire
         )
@@ -236,23 +255,51 @@ void setNativeRtpOutputPacketHandler(
 
 void registerNativeRtpOutput()
 {
-    obs_output_info info{};
+    obs_output_info videoInfo{};
 
-    info.id = "native_rtp_output";
-    info.flags =
+    videoInfo.id =
+        "native_rtp_video_output";
+
+    videoInfo.flags =
+        OBS_OUTPUT_VIDEO |
+        OBS_OUTPUT_ENCODED;
+
+    videoInfo.get_name = getOutputName;
+    videoInfo.create = createOutput;
+    videoInfo.destroy = destroyOutput;
+    videoInfo.start = startOutput;
+    videoInfo.stop = stopOutput;
+    videoInfo.encoded_packet =
+        receiveEncodedPacket;
+
+    obs_register_output(
+        &videoInfo
+    );
+
+    obs_output_info avInfo{};
+
+    avInfo.id =
+        "native_rtp_av_output";
+
+    avInfo.flags =
         OBS_OUTPUT_AV |
         OBS_OUTPUT_ENCODED;
 
-    info.get_name = getOutputName;
-    info.create = createOutput;
-    info.destroy = destroyOutput;
-    info.start = startOutput;
-    info.stop = stopOutput;
-    info.encoded_packet =
+    avInfo.get_name = getOutputName;
+    avInfo.create = createOutput;
+    avInfo.destroy = destroyOutput;
+    avInfo.start = startOutput;
+    avInfo.stop = stopOutput;
+    avInfo.encoded_packet =
         receiveEncodedPacket;
 
-    obs_register_output(&info);
+    obs_register_output(
+        &avInfo
+    );
 
     std::cerr
-        << "[Native RTP Output] registered\n";
+        << "[Native RTP Output] registered"
+        << " video=native_rtp_video_output"
+        << " av=native_rtp_av_output"
+        << "\n";
 }

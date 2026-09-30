@@ -13,6 +13,9 @@ struct BitrateDecision {
 class BitrateController {
 public:
     void setInitialBitrate(uint32_t bitrateBps);
+
+    void setAppliedBitrate(uint32_t bitrateBps);
+
     BitrateDecision update(const NetworkFeedback& feedback);
 
 private:

@@ -1,9 +1,15 @@
 #pragma once
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#else
+using SOCKET = int;
+static constexpr SOCKET INVALID_SOCKET = -1;
+static constexpr int SOCKET_ERROR = -1;
+#endif
 
 #include <atomic>
 #include <array>
@@ -50,8 +56,8 @@ public:
 
     void updateNetworkFeedback(const NetworkFeedback& feedback);
     void setInitialBitrate(uint32_t bitrateBps);
+    void setAppliedBitrate(uint32_t bitrateBps);
     BitrateDecision bitrateDecision() const;
-    bool retransmitPacket(uint16_t rtpSequenceNumber);
 
 private:
     static constexpr size_t MAX_RTP_PACKET_SIZE = 1200;
@@ -61,6 +67,7 @@ private:
     static constexpr size_t TWCC_EXTENSION_BLOCK_SIZE = 4;
     static constexpr size_t RTP_TWCC_HEADER_SIZE =
         RTP_HEADER_SIZE + RTP_EXTENSION_HEADER_SIZE + TWCC_EXTENSION_BLOCK_SIZE;
+    static constexpr size_t RTX_OSN_SIZE = 2;
 
     static constexpr uint8_t TWCC_EXTENSION_ID = 5;
 
@@ -87,7 +94,7 @@ private:
     struct PacketBatch {
         static constexpr uint32_t MAX_PACKETS = 64;
 
-        std::array<const RtpPacket*, MAX_PACKETS> packets {};
+        std::array<RtpPacket*, MAX_PACKETS> packets {};
         uint32_t count = 0;
 
         bool empty() const
@@ -100,7 +107,7 @@ private:
             return count >= MAX_PACKETS;
         }
 
-        bool push(const RtpPacket* packet)
+        bool push(RtpPacket* packet)
         {
             if (!packet || full()) {
                 return false;
@@ -133,13 +140,21 @@ private:
     std::array<RtpPacket, RING_SIZE> ring_ {};
 
     std::thread senderThread_;
+
+    #if defined(_WIN32)
     HANDLE packetAvailableEvent_ = nullptr;
     WSAEVENT socketReadEvent_ = WSA_INVALID_EVENT;
+    #else
+    int packetAvailableEventFd_ = -1;
+    #endif
 
     std::atomic<uint64_t> packetsQueued_{ 0 };
     std::atomic<uint64_t> packetsSent_{ 0 };
     std::atomic<uint64_t> packetsDropped_{ 0 };
     std::atomic<uint64_t> bytesSent_{ 0 };
+
+    std::atomic<uint64_t> wirePacketsSent_{ 0 };
+    std::atomic<uint64_t> wireBytesSent_{ 0 };
     std::atomic<uint32_t> maxQueueSeen_{ 0 };
 
 	std::atomic<uint64_t> publishSequence_{ 0 };
@@ -165,13 +180,42 @@ private:
     std::atomic<uint64_t> pacingCalls_{ 0 };
     std::atomic<uint64_t> packetsProcessedByLoop_{ 0 };
 
+    std::atomic<uint64_t> controlPacketsReceived_{ 0 };
+    std::atomic<uint64_t> controlReceiveErrors_{ 0 };
+    std::atomic<uint64_t> fragmentedNalAdmissionDrops_{ 0 };
+    
     static constexpr size_t RTX_SUPPRESSION_SIZE = 256;
+    static constexpr auto RTX_SUPPRESSION_WINDOW =
+        std::chrono::milliseconds(20);
 
     std::array<uint16_t, RTX_SUPPRESSION_SIZE> lastRetransmitSeqs_ {};
+    std::array<std::chrono::steady_clock::time_point, RTX_SUPPRESSION_SIZE>
+        lastRetransmitTimes_ {};
     std::atomic<uint32_t> lastRetransmitWriteIndex_{ 0 };
 
     std::atomic<uint32_t> retransmitsThisSecond_{ 0 };
     std::chrono::steady_clock::time_point retransmitWindowStartedAt_{};
+
+    static constexpr size_t RETRANSMIT_PENDING_SIZE = 256;
+
+    struct PendingRetransmit {
+        uint16_t rtpSequenceNumber = 0;
+        uint64_t sequence = 0;
+        std::chrono::steady_clock::time_point enqueuedAt {};
+    };
+
+    std::array<PendingRetransmit, RETRANSMIT_PENDING_SIZE> pendingRetransmits_ {};
+    std::atomic<uint64_t> retransmitPublishSequence_{ 0 };
+    std::atomic<uint64_t> retransmitConsumeSequence_{ 0 };
+
+    std::atomic<uint64_t> retransmitRequests_{ 0 };
+    std::atomic<uint64_t> retransmitQueued_{ 0 };
+    std::atomic<uint64_t> retransmitQueueDropped_{ 0 };
+    std::atomic<uint64_t> retransmitPacketsSent_{ 0 };
+    std::atomic<uint64_t> retransmitSendFailures_{ 0 };
+    std::atomic<uint32_t> maxRetransmitQueueSeen_{ 0 };
+    std::atomic<uint32_t> maxRetransmitQueueLatencyMs_{ 0 };
+    std::atomic<uint64_t> retransmitRateLimited_{ 0 };
 
     bool enqueueRtpPacket(
         const uint8_t* payload,
@@ -190,14 +234,38 @@ private:
 
     bool sendRawPacket(const RtpPacket& packet);
     void flushPacketBatch(const PacketBatch& batch);
+    void assignTransportWideSequenceNumber(RtpPacket& packet);
     RtpPacer pacer_;
     void storeHistoryPacket(const RtpPacket& packet);
     bool sendRawPacketInternal(const RtpPacket& packet, bool storeHistory);
-    bool sendRtxPacket(const HistoryPacket& slot);
+    bool buildRetransmitPacket(
+        const HistoryPacket& slot,
+        RtpPacket& packet
+    );
+    bool enqueueRetransmitRequest(uint16_t rtpSequenceNumber);
+    bool serviceOnePendingRetransmit(
+        std::chrono::steady_clock::time_point& nextSendTime,
+        uint32_t mediaQueueDepth
+    );
+    void signalSender();
     void drainIncomingControlPackets();
     void handleIncomingControlPacket(const uint8_t* data, int size);
     void handleRtcpGenericNack(const uint8_t* data, int size);
-    bool shouldSuppressRetransmit(uint16_t rtpSequenceNumber);
+    
+    bool retransmitPacket(uint16_t rtpSequenceNumber);
+    bool consumeRetransmitBudget(
+        std::chrono::steady_clock::time_point now
+    );
+
+    bool isRetransmitSuppressed(
+        uint16_t rtpSequenceNumber,
+        std::chrono::steady_clock::time_point now
+    ) const;
+
+    void rememberRetransmit(
+        uint16_t rtpSequenceNumber,
+        std::chrono::steady_clock::time_point now
+    );
     void handleRtcpTransportWideFeedback(const uint8_t* data, int size);
     
     void senderLoop();

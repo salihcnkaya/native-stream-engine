@@ -5,6 +5,7 @@
 struct NetworkFeedback {
     double packetLossRatio = 0.0;
     uint32_t jitterMs = 0;
+    bool hasRtt = false;
     uint32_t rttMs = 0;
     uint32_t score = 10;
 

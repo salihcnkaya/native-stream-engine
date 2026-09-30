@@ -8,6 +8,16 @@ void BitrateController::setInitialBitrate(uint32_t bitrateBps)
     stableFeedbackCount_ = 0;
 }
 
+void BitrateController::setAppliedBitrate(uint32_t bitrateBps)
+{
+    if (bitrateBps == 0) {
+        return;
+    }
+
+    currentTargetBitrateBps_ = bitrateBps;
+    stableFeedbackCount_ = 0;
+}
+
 BitrateDecision BitrateController::update(const NetworkFeedback& feedback)
 {
     BitrateDecision decision;
@@ -46,8 +56,7 @@ BitrateDecision BitrateController::update(const NetworkFeedback& feedback)
         );
 
         if (reduced < currentTargetBitrateBps_) {
-            currentTargetBitrateBps_ = reduced;
-            decision.targetBitrateBps = currentTargetBitrateBps_;
+            decision.targetBitrateBps = reduced;
             decision.shouldChangeEncoder = true;
         }
 
@@ -64,7 +73,7 @@ BitrateDecision BitrateController::update(const NetworkFeedback& feedback)
         stableFeedbackCount_++;
 
         if (stableFeedbackCount_ >= 3) {
-            stableFeedbackCount_ = 0;
+            stableFeedbackCount_ = 3;
 
             const uint32_t increased = std::min(
                 maxBitrateBps_,
@@ -72,8 +81,7 @@ BitrateDecision BitrateController::update(const NetworkFeedback& feedback)
             );
 
             if (increased > currentTargetBitrateBps_) {
-                currentTargetBitrateBps_ = increased;
-                decision.targetBitrateBps = currentTargetBitrateBps_;
+                decision.targetBitrateBps = increased;
                 decision.shouldChangeEncoder = true;
             }
         }

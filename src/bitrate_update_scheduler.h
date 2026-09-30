@@ -12,6 +12,8 @@ class BitrateUpdateScheduler {
 public:
     BitrateUpdateDecision update(uint32_t targetBitrateBps);
 
+    void markApplied(uint32_t appliedBitrateBps);
+
     void reset();
 
 private:
